@@ -407,73 +407,64 @@ if (currentItem.type === CommandType.GeneralAction) {
 }
 ```
 
-#### 4.3.3 两条路径对比：setup vs registerRouteChange
+#### 4.3.3 两层含义区分
 
-| 路径 | 调用方式 | checkPageUrl 是否入队 | 说明 |
-|-----|---------|---------------------|------|
-| `setup()` | `setTimeout(() => void checkPageUrl(), 0)` | **否**（直接调用） | `checkPageUrl` 本身不入队，内部才会入队具体 action |
-| `registerRouteChange()` | `await queue.add(checkPageUrl, CommandType.GeneralAction)` | **是** | `checkPageUrl` 作为整体入队 |
+需要区分两个独立的概念：
+
+**第一层：函数本身属性**
+
+`checkPageUrl` 本质上是一个**检查器函数**，它的职责是：
+- 遍历 `actionClasses` 中的 `pageView` 类型动作
+- 调用 `handleUrlFilters()` 检查当前 URL 是否匹配
+- **URL 匹配成功后**，在内部调用 `queue.add()` 入队具体的 action handler
 
 ```typescript
-// 路径1: setup() - packages/js-core/src/index.ts:42-48
-const setup = async (setupConfig) => {
-  await queue.add(Setup.setup, CommandType.Setup, false, setupConfig);
-  await queue.wait();
-  
-  // ❌ checkPageUrl 本身不入队，直接调用
-  setTimeout(() => {
-    void checkPageUrl();  // 裸调用，没有 queue.add 包裹
-  }, 0);
-};
+// checkPageUrl 内部 - packages/js-core/src/lib/survey/no-code-action.ts:155-162
+if (isValidUrl) {
+  await queue.add(
+    trackNoCodePageViewActionHandler,  // 真正入队的是这个 handler
+    CommandType.GeneralAction,
+    true,
+    event.name
+  );
+}
+```
+
+**第二层：在特定调用路径下的使用方式**
+
+同一个 `checkPageUrl` 函数，在不同路径下有两种使用方式：
+
+| 调用路径 | 使用方式 | 说明 |
+|---------|---------|------|
+| `setup()` | **裸调用**（不入队） | `setTimeout(() => void checkPageUrl(), 0)` |
+| `registerRouteChange()` | **作为命令入队** | `queue.add(checkPageUrl, CommandType.GeneralAction)` |
+
+```typescript
+// 路径1: setup() - packages/js-core/src/index.ts:45-47
+// checkPageUrl 本身不入队，直接在 setTimeout 回调中执行
+setTimeout(() => {
+  void checkPageUrl();  // 裸调用
+}, 0);
 
 // 路径2: registerRouteChange() - packages/js-core/src/index.ts:82-84
+// checkPageUrl 作为整体被 queue.add 包裹，成为队列中的一条命令
 const registerRouteChange = async (): Promise<void> => {
-  // ✅ checkPageUrl 作为整体入队
   await queue.add(checkPageUrl, CommandType.GeneralAction);
 };
 ```
 
-#### 4.3.4 checkPageUrl 内部真正入队的是什么
+#### 4.3.4 两条路径的核心差异
 
-`checkPageUrl` 函数**本身不是 CommandQueue 的命令**，它是一个检查函数，内部会根据 URL 匹配结果决定是否入队具体的 action：
+| 维度 | setup 路径 | registerRouteChange 路径 |
+|-----|-----------|------------------------|
+| **checkPageUrl 是否入队** | ❌ 不入队，裸调用 | ✅ 入队，作为命令执行 |
+| **内部 action 何时入队** | setTimeout 回调执行时 | checkPageUrl 作为命令被消费时 |
+| **CommandType** | 无（checkPageUrl 本身不是命令） | `CommandType.GeneralAction` |
 
-```typescript
-// packages/js-core/src/lib/survey/no-code-action.ts:122-157
-export const checkPageUrl = async (): Promise<Result<void, unknown>> => {
-  // 1. 获取 actionClasses
-  const actionClasses = appConfig.get().environment.data.actionClasses;
-  
-  // 2. 筛选 pageView 类型的 noCode action
-  const noCodePageViewActionClasses = actionClasses.filter(
-    (action) => action.type === "noCode" && action.noCodeConfig?.type === "pageView"
-  );
-  
-  // 3. 遍历检查每个 pageView action
-  for (const event of noCodePageViewActionClasses) {
-    const isValidUrl = handleUrlFilters(urlFilters, connector);
-    
-    if (isValidUrl) {
-      // 4. URL 匹配成功后，才真正入队 GeneralAction
-      await queue.add(
-        trackNoCodePageViewActionHandler,  // 具体的 handler 函数
-        CommandType.GeneralAction,          // 类型是 GeneralAction
-        true,
-        event.name                          // action 名称
-      );
-    }
-  }
-  
-  // 5. 额外检查 pageDwell（页面停留时间）
-  checkTimeOnPage(actionClasses);
-  
-  return { ok: true, data: undefined };
-};
-```
+**两句结论**：
 
-**关键区别**：
-- `checkPageUrl` 是**检查器**，不是命令
-- 真正入队的是 `trackNoCodePageViewActionHandler`，类型为 `CommandType.GeneralAction`
-- 如果 URL 都不匹配，`checkPageUrl` 内部**不会入队任何东西**
+- **setup 路径**：`checkPageUrl` 通过 `setTimeout` 延迟到下一事件循环**裸调用**，确保 `setUserId` 等同步 UserAction 先入队执行。
+- **registerRouteChange 路径**：`checkPageUrl` **作为命令被 queue.add 入队**，类型为 `GeneralAction`，执行前会等待 UpdateQueue 完成。
 
 #### 4.3.5 Setup 后的时序（修正版）
 
