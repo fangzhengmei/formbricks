@@ -767,15 +767,191 @@ useEffect(() => {
 }, [history.length, isSurveyFinished, offlinePersistEnabled, responseQueue, pendingSyncCount]);
 ```
 
-### 3.5 进度清除时机
+### 3.5 页面刷新后的状态重置机制
 
-问卷进度在以下情况会被清除：
+页面刷新时，状态的重置分为两个独立层面：**内存态重置** 和 **IndexedDB 进度清除**，两者触发条件和逻辑完全不同。
 
-1. **进度过期**：超过 24 小时（`packages/surveys/src/components/general/survey.tsx:448-452`）
-2. **问卷已完成且无待发送响应**：避免恢复到结束页（`packages/surveys/src/components/general/survey.tsx:460-468`）
-3. **问卷结构变化**：保存的 blockId 不再存在（`packages/surveys/src/components/general/survey.tsx:523-532`）
-4. **离线响应同步成功**：所有响应发送成功后（`packages/surveys/src/components/general/survey.tsx:585-590`）
-5. **SurveyState.setSurveyId()**：切换问卷时自动清除（`packages/surveys/src/lib/survey-state.ts:31-34`）
+#### 3.5.1 内存态重置（SurveyState 重置）
+
+**内存态重置是自动的、必然发生的，与 IndexedDB 无关。**
+
+当页面刷新时，Survey 组件重新挂载，SurveyState 会通过 `useMemo` 重新创建：
+
+```typescript
+// packages/surveys/src/components/general/survey.tsx:124-133
+const surveyState = useMemo(() => {
+  if (appUrl && environmentId) {
+    if (mode === "inline") {
+      return new SurveyState(survey.id, singleUseId, singleUseResponseId, userId, contactId);
+    }
+    return new SurveyState(survey.id, null, null, userId, contactId);
+  }
+  return null;
+}, [appUrl, environmentId, mode, survey.id, userId, singleUseId, singleUseResponseId, contactId]);
+```
+
+**SurveyState 构造时的初始值**：
+- `responseId`: `null`
+- `displayId`: `null`
+- `shouldCreateResponseFromState`: `false`
+- `responseAcc`: `{ finished: false, data: {}, ttc: {}, variables: {} }`
+- `singleUseId`: `null`（除非在构造参数中传入）
+- `userId`: `null`（除非在构造参数中传入）
+- `contactId`: `null`（除非在构造参数中传入）
+
+**SurveyState.clear() 的唯一触发场景**：
+
+`SurveyState.clear()` 方法只在 `setSurveyId()` 被调用时才会触发：
+
+```typescript
+// packages/surveys/src/lib/survey-state.ts:31-34
+setSurveyId(id: string) {
+  this.surveyId = id;
+  this.clear(); // Reset the state when setting a new surveyId
+}
+```
+
+这个场景非常罕见，主要用于**问卷编辑器**中问卷结构变化时重置状态。在正常的问卷填写流程中，`setSurveyId()` 几乎不会被调用。
+
+**clear() 方法只重置以下字段**：
+```typescript
+// packages/surveys/src/lib/survey-state.ts:119-123
+clear() {
+  this.responseId = null;
+  this.shouldCreateResponseFromState = false;
+  this.responseAcc = { finished: false, data: {}, ttc: {}, variables: {} };
+}
+```
+
+注意：`clear()` 不会重置 `displayId`、`userId`、`contactId`、`singleUseId` 这些字段。
+
+#### 3.5.2 IndexedDB 进度清除（`clearSurveyProgress()`）
+
+IndexedDB 进度清除是独立的逻辑，与 SurveyState.clear() 没有直接关系。只有在恢复阶段发现进度**无效**时才会主动清除。
+
+**清除触发时机**：
+
+| 场景 | 代码位置 | 说明 |
+|------|----------|------|
+| **进度过期** | `survey.tsx:448-452` | 超过 24 小时，直接清除 |
+| **问卷已完成且无待发送响应** | `survey.tsx:460-468` | 避免恢复到结束页，重新开始新问卷 |
+| **问卷结构变化** | `survey.tsx:523-526` | 保存的 blockId 不再存在，**只清除 UI 进度，但保留 SurveyState 快照用于响应恢复** |
+| **离线响应同步成功** | `survey.tsx:585-590` | 所有响应发送成功后清除 |
+
+**详细逻辑分析**：
+
+**场景 1：进度过期（超过 24 小时）**
+```typescript
+// packages/surveys/src/components/general/survey.tsx:447-452
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+if (Date.now() - progress.updatedAt > MAX_AGE_MS) {
+  await clearSurveyProgress(survey.id);
+  setProgressRestored(true);
+  return;  // 直接返回，不恢复任何状态
+}
+```
+- 行为：完全清除 IndexedDB，从头开始新问卷
+- SurveyState：保持新创建的初始状态
+
+**场景 2：问卷已完成且无待发送响应**
+```typescript
+// packages/surveys/src/components/general/survey.tsx:458-468
+const pendingCount = responseQueue ? await responseQueue.loadPersistedQueue() : 0;
+
+if (pendingCount === 0) {
+  const isEndingCard = localSurvey.endings.some((e) => e.id === progress.blockId);
+  const isResponseFinished = progress.surveyStateSnapshot?.responseAcc?.finished === true;
+
+  if (isEndingCard || isResponseFinished) {
+    await clearSurveyProgress(survey.id);
+    setProgressRestored(true);
+    return;
+  }
+}
+```
+- 行为：问卷已完成且没有待发送的响应，说明用户已经完成了问卷
+- 清除 IndexedDB，让用户可以重新开始
+
+**场景 3：问卷结构变化（blockId 不存在）**
+```typescript
+// packages/surveys/src/components/general/survey.tsx:523-531
+} else {
+  // Block no longer exists (survey structure changed) — discard UI progress
+  // but still restore survey state and sync pending responses below.
+  await clearSurveyProgress(survey.id);
+
+  if (surveyState && progress.surveyStateSnapshot) {
+    restoreSurveyStateFromSnapshot(surveyState, progress.surveyStateSnapshot, progress);
+    responseQueue?.updateSurveyState(surveyState);
+  }
+}
+```
+- **关键行为**：
+  - 清除 IndexedDB 中的 UI 进度（blockId、history 等）
+  - **但仍然恢复 SurveyState 快照**（responseId、displayId、responseAcc 等）
+  - 保留待发送的响应以便同步
+- 设计意图：问卷结构可能已更新，UI 进度已失效，但已填写的数据仍然有效，需要继续发送
+
+**场景 4：离线响应同步成功**
+```typescript
+// packages/surveys/src/components/general/survey.tsx:582-590
+if (result.success) {
+  await clearSurveyProgress(survey.id);
+
+  if (result.syncedCount > 0) {
+    setIsResponseSendingFinished(true);
+  }
+}
+```
+- 行为：所有响应同步成功后，清除 IndexedDB 进度
+- 此时用户可能已经完成了问卷
+
+#### 3.5.3 刷新后的状态恢复优先级
+
+页面刷新后，状态恢复遵循以下优先级：
+
+1. **IndexedDB 检查**（恢复阶段）：
+   - 有有效进度 → 恢复 SurveyState 快照
+   - 无有效进度 → SurveyState 保持初始状态
+
+2. **SurveyState 快照恢复**（`restoreSurveyStateFromSnapshot`）：
+   ```typescript
+   // packages/surveys/src/components/general/survey.tsx:42-64
+   const restoreSurveyStateFromSnapshot = (
+     surveyState: SurveyState,
+     snapshot: SerializedSurveyState,
+     progress: { ... }
+   ): void => {
+     if (snapshot.responseId) surveyState.updateResponseId(snapshot.responseId);
+     if (snapshot.displayId) surveyState.updateDisplayId(snapshot.displayId);
+     if (snapshot.userId) surveyState.updateUserId(snapshot.userId);
+     if (snapshot.contactId) surveyState.updateContactId(snapshot.contactId);
+     if (snapshot.singleUseId) surveyState.singleUseId = snapshot.singleUseId;
+     surveyState.disableBootstrapResponseCreate();
+     surveyState.responseAcc = {
+       ...snapshot.responseAcc,
+       data: progress.responseData,
+       ttc: progress.ttc,
+       variables: progress.currentVariables,
+       displayId: snapshot.displayId ?? snapshot.responseAcc.displayId,
+     };
+   };
+   ```
+
+3. **特殊情况：有 displayId 但无 responseId**
+   - 如果 IndexedDB 中保存了 `displayId` 但没有 `responseId`，会尝试通过 `displayId` 查找 `responseId`
+   - 查找不到则设置 `enableBootstrapResponseCreate()`，下次发送时使用累积的 responseAcc 创建响应
+
+#### 3.5.4 状态重置/清除的对比总结
+
+| 操作 | 触发条件 | 重置内容 | 目的 |
+|------|----------|----------|------|
+| **页面刷新**（自动） | 页面重新加载 | SurveyState 重新创建，所有字段初始化为默认值 | React 组件生命周期的自然结果 |
+| **SurveyState.clear()** | 仅 `setSurveyId()` 调用时 | `responseId`, `shouldCreateResponseFromState`, `responseAcc` | 问卷编辑器中切换问卷时重置 |
+| **clearSurveyProgress(过期)** | 进度超过 24 小时 | 完全清除 IndexedDB | 过期数据清理 |
+| **clearSurveyProgress(已完成)** | 问卷已完成且无待发送响应 | 完全清除 IndexedDB | 允许用户重新开始 |
+| **clearSurveyProgress(结构变化)** | blockId 不存在 | 清除 UI 进度，但**保留 SurveyState 快照** | UI 失效但数据仍需同步 |
+| **clearSurveyProgress(同步成功)** | 所有响应发送成功 | 完全清除 IndexedDB | 会话完成清理 |
 
 ---
 
@@ -851,57 +1027,89 @@ useEffect(() => {
 ### 4.3 页面刷新恢复数据流
 
 ```
-页面刷新 → Survey 组件挂载
-        │
-        ▼
-┌────────────────────────────────┐
-│ offlinePersistEnabled?         │────────┐
-└───────────┬────────────────────┘        │
-            │ 否                          │
-            ▼                              ▼
-┌────────────────────────┐      ┌─────────────────────────────┐
-│ 从头开始新问卷          │      │ getSurveyProgress(surveyId) │
-└────────────────────────┘      │ from IndexedDB              │
-                                └───────────┬─────────────────┘
-                                            │
-                                            ▼
-                                ┌─────────────────────────────┐
-                                │ 检查进度有效性               │
-                                │ - 未过期？（<24h）          │
-                                │ - 问卷未完成？               │
-                                │ - blockId 仍存在？          │
-                                └───────────┬─────────────────┘
-                                            │
-                                            ▼
-                                ┌─────────────────────────────┐
-                                │ 恢复状态                     │
-                                │ - blockId, responseData     │
-                                │ - SurveyState 快照           │
-                                │ - 待发送响应计数             │
-                                └───────────┬─────────────────┘
-                                            │
-                                            ▼
-                                ┌─────────────────────────────┐
-                                │ 在线？                       │────────┐
-                                └───────────┬─────────────────┘        │
-                                            │ 否                        │ 是
-                                            ▼                          ▼
-                                ┌─────────────────────┐      ┌────────────────────────┐
-                                │ 继续填写             │      │ syncPersistedResponses │
-                                │ 进度保存在 IndexedDB │      │ 发送待处理响应          │
-                                └─────────────────────┘      └───────────┬────────────┘
-                                                                         │
-                                                                         ▼
-                                                               ┌────────────────────────┐
-                                                               │ 发送成功？              │
-                                                               └───────────┬────────────┘
-                                                                           │
-                                                                           ▼
-                                                              ┌─────────────────────────┐
-                                                              │ clearSurveyProgress()   │
-                                                              │ 清除问卷进度            │
-                                                              └─────────────────────────┘
+页面刷新
+    │
+    ▼
+┌─────────────────────────────────────┐
+│ 步骤 1：内存态重置（自动、必然）      │
+│ Survey 组件重新挂载                  │
+│ SurveyState 通过 useMemo 重新创建    │
+│ 所有字段初始化为默认值                │
+└───────────┬─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────┐
+│ 步骤 2：检查 offlinePersistEnabled? │─────────┐
+└───────────┬─────────────────────────┘         │
+            │ 否                                 │
+            ▼                                    ▼
+┌────────────────────────┐         ┌──────────────────────────────────┐
+│ 从头开始新问卷          │         │ 步骤 3：从 IndexedDB 读取进度     │
+│ SurveyState 保持初始态 │         │ getSurveyProgress(surveyId)      │
+└────────────────────────┘         └───────────┬──────────────────────┘
+                                              │
+                                              ▼
+                                    ┌──────────────────────────────┐
+                                    │ 步骤 4：检查进度有效性         │
+                                    │ ┌────────────────────────┐   │
+                                    │ │ 进度过期？（>24h）      │───┼──▶ clearSurveyProgress()
+                                    │ │                        │   │     → 从头开始
+                                    │ └────────────────────────┘   │
+                                    │ ┌────────────────────────┐   │
+                                    │ │ 问卷已完成且无待发送响应？│──┼──▶ clearSurveyProgress()
+                                    │ │                        │   │     → 从头开始
+                                    │ └────────────────────────┘   │
+                                    │ ┌────────────────────────┐   │
+                                    │ │ blockId 不存在？        │───┼──▶ 特殊处理
+                                    │ │                        │   │     清除 UI 进度
+                                    │ │                        │   │     但保留 SurveyState 快照
+                                    │ └────────────────────────┘   │
+                                    └───────────┬──────────────────┘
+                                                │ 有效
+                                                ▼
+                                    ┌──────────────────────────────┐
+                                    │ 步骤 5：恢复状态               │
+                                    │ - UI 状态：blockId, history  │
+                                    │ - 响应数据：responseData, ttc │
+                                    │ - SurveyState 快照恢复        │
+                                    │   → restoreSurveyStateFromSnapshot()
+                                    │   → 覆盖新创建的默认值         │
+                                    └───────────┬──────────────────┘
+                                                │
+                                                ▼
+                                    ┌──────────────────────────────┐
+                                    │ 步骤 6：检查在线状态           │─────────┐
+                                    └───────────┬──────────────────┘         │
+                                                │ 否                         │ 是
+                                                ▼                            ▼
+                                    ┌─────────────────────┐        ┌────────────────────────────┐
+                                    │ 继续填写             │        │ 步骤 7：同步待处理响应       │
+                                    │ 进度保存在 IndexedDB │        │ syncPersistedResponses()   │
+                                    └─────────────────────┘        └───────────┬────────────────┘
+                                                                               │
+                                                                               ▼
+                                                                     ┌────────────────────────┐
+                                                                     │ 发送成功？              │
+                                                                     └───────────┬────────────┘
+                                                                                 │
+                                                                                 ▼
+                                                                    ┌─────────────────────────┐
+                                                                    │ clearSurveyProgress()   │
+                                                                    │ 清除问卷进度（会话完成）  │
+                                                                    └─────────────────────────┘
 ```
+
+#### 关键流程说明
+
+1. **步骤 1（内存态重置）**：页面刷新时，React 组件生命周期导致 SurveyState 必然重新创建，所有字段初始化为默认值。这与 IndexedDB 无关。
+
+2. **步骤 3-5（IndexedDB 恢复）**：如果启用了离线持久化，才会从 IndexedDB 读取进度。恢复时会覆盖 SurveyState 的默认值。
+
+3. **步骤 4（无效进度处理）**：
+   - 过期或已完成 → 完全清除 IndexedDB
+   - blockId 不存在 → 清除 UI 进度，但保留 SurveyState 快照用于响应恢复
+
+4. **步骤 7（同步响应）**：只有在线时才会发送待处理响应，同步成功后清除 IndexedDB 进度。
 
 ---
 
@@ -928,9 +1136,30 @@ Formbricks SDK 的会话状态保留机制采用 **分层架构**：
 2. **问卷进度层**（IndexedDB）：存储 Link 问卷的填写进度和待发送响应，支持断点续填和离线同步
 3. **内存状态层**（SurveyState）：管理当前问卷会话的内存状态，提供响应累积和状态快照能力
 
-核心特性：
+### 关键修正：内存态重置 vs IndexedDB 清除
+
+这两个是**完全独立**的概念，之前的混淆需要明确区分：
+
+| 概念 | 触发时机 | 行为 |
+|------|----------|------|
+| **内存态重置** | 页面刷新时自动发生 | SurveyState 重新创建，所有字段初始化为默认值 |
+| **IndexedDB 清除** | 恢复阶段发现进度无效时主动调用 | 清除或部分清除 IndexedDB 中的持久化数据 |
+
+**页面刷新时的实际流程**：
+1. Survey 组件重新挂载 → SurveyState 通过 `useMemo` 重新创建（内存态重置）
+2. 恢复阶段检查 IndexedDB → 有有效进度则恢复快照到新创建的 SurveyState
+3. 无有效进度 → SurveyState 保持初始状态，从头开始
+
+**SurveyState.clear() 的真实用途**：
+- 只在 `setSurveyId()` 被调用时触发
+- 这个场景仅用于**问卷编辑器**，正常问卷填写流程几乎不会调用
+- `clear()` 只重置 `responseId`、`shouldCreateResponseFromState`、`responseAcc`，不会重置 `displayId` 等其他字段
+
+### 核心特性
+
 - 支持 **24 小时** 内的问卷进度保留
 - 支持 **离线** 环境下的问卷填写和响应暂存
 - 网络恢复后 **自动同步** 待发送响应
 - 页面关闭前 **提醒** 用户防止意外丢失
 - 问卷结构变化时 **智能降级**（保留响应数据，重置 UI 进度）
+- **IndexedDB 与内存态独立管理**：刷新时内存态必然重置，但 IndexedDB 的清除是条件判断后的主动行为
