@@ -659,9 +659,116 @@ if (!blocks.find((b) => b.id === destination)) {
 
 ---
 
-## 5. 完整示例
+## 5. 校验顺序与互斥关系
 
-### 5.1 合法配置示例
+### 5.1 校验函数执行顺序
+
+**位置**: `packages/types/surveys/types.ts:3727-3747`
+
+校验函数按以下顺序执行：
+
+```
+validateBlockLogic(survey, blockIndex, block, allElements)
+  │
+  ├── 第一步：validateBlockLogicFallback(...)  ← fallback 校验
+  │     │
+  │     ├── 校验1：有 fallback 但无 logic 规则 → 直接返回
+  │     ├── 校验2：fallback 指向当前块 → 直接返回
+  │     └── 校验3：fallback 目标不存在 → 直接返回
+  │
+  └── 第二步：遍历 block.logic，对每条规则执行：
+        │
+        ├── validateBlockConditions(...)  ← 条件校验
+        │
+        └── validateBlockActions(...)  ← 动作校验
+              │
+              ├── 遍历每个 action：
+              │     │
+              │     ├── calculate 类型校验
+              │     ├── requireAnswer 类型校验
+              │     └── jumpToBlock 类型校验
+              │           │
+              │           ├── 校验A：目标不存在 → 直接返回（后续校验不再执行）
+              │           └── 校验B：目标是当前块 → 直接返回（前提：先通过校验A）
+              │
+              └── 最后：统计 jumpToBlock 数量
+                    └── 校验C：多条跳转动作 → 追加到错误列表
+```
+
+### 5.2 互斥关系说明
+
+**关键理解**：单个校验函数内部是**按顺序 `return`**，不是累积所有错误。
+
+#### 5.2.1 fallback 校验的互斥关系
+
+`validateBlockLogicFallback` 内部是按顺序 `return`：
+
+```typescript
+// 校验1：有 fallback 但无 logic
+if (!block.logic?.length && block.logicFallback) {
+  return [/* 错误1 */];  // ← 直接返回，校验2、3不执行
+}
+
+// 校验2：fallback 指向当前块
+if (block.id === block.logicFallback) {
+  return [/* 错误2 */];  // ← 直接返回，校验3不执行
+}
+
+// 校验3：fallback 目标不存在
+if (!possibleFallbackIds.includes(block.logicFallback)) {
+  return [/* 错误3 */];
+}
+```
+
+**互斥关系**：
+| 校验 | 条件 | 与其他校验的关系 |
+|------|------|------------------|
+| 1: fallback 无 logic | `logic: []` 且有 `logicFallback` | **独占**，触发后校验2、3不执行 |
+| 2: fallback 指向当前块 | `logicFallback === 当前块ID` | 前提：有 logic 规则；**与校验3互斥** |
+| 3: fallback 目标无效 | `logicFallback` 不在合法列表中 | 前提：有 logic 规则，且不是当前块 |
+
+#### 5.2.2 jumpToBlock 动作校验的互斥关系
+
+`validateBlockActions` 中对单个 `jumpToBlock` action 的校验：
+
+```typescript
+// 校验A：目标不存在
+if (!possibleTargets.includes(targetBlockId)) {
+  return {/* 错误A */};  // ← 直接返回，校验B不执行
+}
+
+// 校验B：跳转到当前块
+if (targetBlockId === currentBlock.id) {
+  return {/* 错误B */};
+}
+```
+
+**互斥关系**：
+| 校验 | 条件 | 与其他校验的关系 |
+|------|------|------------------|
+| A: jump 目标无效 | target 不在 blocks + endings 中 | **独占**，触发后校验B不执行 |
+| B: 跳转到当前块 | target === 当前块ID | 前提：目标存在（校验A通过） |
+
+#### 5.2.3 多条跳转动作校验
+
+"多条跳转动作"（校验C）是在遍历完所有 action 后**单独检查**的：
+
+```typescript
+// 在 forEach 之后执行
+const jumpToBlockActions = actions.filter((action) => action.objective === "jumpToBlock");
+if (jumpToBlockActions.length > 1) {
+  actionIssues.push({/* 错误C */});  // ← 追加，不是 return
+}
+```
+
+这意味着**校验C可以与其他错误同时出现**：
+- 示例：两个 jumpToBlock 动作，其中一个目标不存在 → 会同时触发"目标无效" + "多条跳转动作"
+
+---
+
+## 6. 完整示例
+
+### 6.1 合法配置示例
 
 ```json
 {
@@ -751,21 +858,25 @@ if (!blocks.find((b) => b.id === destination)) {
 - `logicFallback`（block3）存在且不是当前块
 - 无循环（block1 → block2/block3 → 结束，都是单向向前）
 
-### 5.2 非法配置示例（会被校验拦截）
+### 6.2 非法配置最小示例（每条错误独立触发）
+
+以下每个示例**只触发一个特定错误**，用于演示校验逻辑。
+
+#### 6.2.1 示例1：jumpToBlock 目标无效
 
 ```json
 {
-  "id": "survey_illegal",
-  "name": "错误配置示例",
+  "id": "err_jump_target_not_exist",
+  "name": "跳转目标不存在",
   "blocks": [
     {
       "id": "block1",
-      "name": "问题块1",
+      "name": "块1",
       "elements": [
         {
           "id": "q1",
           "type": "openText",
-          "headline": { "default": "输入任意内容" },
+          "headline": { "default": "问题1" },
           "required": true,
           "inputType": "text"
         }
@@ -790,35 +901,341 @@ if (!blocks.find((b) => b.id === destination)) {
               "id": "act1",
               "objective": "jumpToBlock",
               "target": "nonExistentBlock"
-            },
-            {
-              "id": "act2",
-              "objective": "jumpToBlock",
-              "target": "block1"
             }
           ]
         }
-      ],
-      "logicFallback": "block1"
+      ]
     }
   ],
   "endings": []
 }
 ```
 
-**会被拦截的错误**（共 5 个）：
+**触发的错误**：
+| 校验项 | 错误消息 |
+|--------|----------|
+| jumpToBlock 目标无效 | `Block ID nonExistentBlock does not exist in logic no: 1 of block 1` |
 
-| 序号 | 错误类型 | 触发位置 | 错误消息 |
-|------|----------|----------|----------|
-| 1 | **jumpToBlock 目标无效** | `logic[0].actions[0].target = "nonExistentBlock"` | `Block ID nonExistentBlock does not exist in logic no: 1 of block 1` |
-| 2 | **跳转到当前块** | `logic[0].actions[1].target = "block1"` | `Cannot jump to the current block in logic no: 1 of block 1` |
-| 3 | **多条跳转动作** | `logic[0].actions` 中有 2 个 jumpToBlock | `Multiple jump actions are not allowed in logic no: 1 of block 1` |
-| 4 | **fallback 指向当前块** | `logicFallback = "block1"` | `Fallback logic is defined with the same block in block 1` |
-| 5 | **fallback 目标无效** | `logicFallback = "block1"` 不在其他块/结束卡中 | `Fallback block ID block1 does not exist in block 1` |
+**说明**：`nonExistentBlock` 不在 `blocks` 或 `endings` 中。
 
 ---
 
-## 6. 关键文件索引
+#### 6.2.2 示例2：跳转到当前块
+
+```json
+{
+  "id": "err_jump_to_self",
+  "name": "跳转到当前块",
+  "blocks": [
+    {
+      "id": "block1",
+      "name": "块1",
+      "elements": [
+        {
+          "id": "q1",
+          "type": "openText",
+          "headline": { "default": "问题1" },
+          "required": true,
+          "inputType": "text"
+        }
+      ],
+      "logic": [
+        {
+          "id": "logic1",
+          "conditions": {
+            "id": "group1",
+            "connector": "and",
+            "conditions": [
+              {
+                "id": "cond1",
+                "leftOperand": { "type": "element", "value": "q1" },
+                "operator": "isNotEmpty",
+                "rightOperand": { "type": "static", "value": "" }
+              }
+            ]
+          },
+          "actions": [
+            {
+              "id": "act1",
+              "objective": "jumpToBlock",
+              "target": "block1"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "endings": []
+}
+```
+
+**触发的错误**：
+| 校验项 | 错误消息 |
+|--------|----------|
+| 跳转到当前块 | `Cannot jump to the current block in logic no: 1 of block 1` |
+
+**说明**：`target = "block1"` 与当前块 ID 相同。
+
+---
+
+#### 6.2.3 示例3：多条跳转动作
+
+```json
+{
+  "id": "err_multiple_jumps",
+  "name": "多条跳转动作",
+  "blocks": [
+    {
+      "id": "block1",
+      "name": "块1",
+      "elements": [
+        {
+          "id": "q1",
+          "type": "openText",
+          "headline": { "default": "问题1" },
+          "required": true,
+          "inputType": "text"
+        }
+      ],
+      "logic": [
+        {
+          "id": "logic1",
+          "conditions": {
+            "id": "group1",
+            "connector": "and",
+            "conditions": [
+              {
+                "id": "cond1",
+                "leftOperand": { "type": "element", "value": "q1" },
+                "operator": "isNotEmpty",
+                "rightOperand": { "type": "static", "value": "" }
+              }
+            ]
+          },
+          "actions": [
+            {
+              "id": "act1",
+              "objective": "jumpToBlock",
+              "target": "block2"
+            },
+            {
+              "id": "act2",
+              "objective": "jumpToBlock",
+              "target": "ending1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "block2",
+      "name": "块2",
+      "elements": []
+    }
+  ],
+  "endings": [
+    {
+      "id": "ending1",
+      "headline": { "default": "结束" },
+      "type": "endScreen"
+    }
+  ]
+}
+```
+
+**触发的错误**：
+| 校验项 | 错误消息 |
+|--------|----------|
+| 多条跳转动作 | `Multiple jump actions are not allowed in logic no: 1 of block 1` |
+
+**说明**：同一条逻辑规则中定义了 2 个 `jumpToBlock` 动作。
+
+---
+
+#### 6.2.4 示例4：fallback 无 logic
+
+```json
+{
+  "id": "err_fallback_no_logic",
+  "name": "有fallback但无logic规则",
+  "blocks": [
+    {
+      "id": "block1",
+      "name": "块1",
+      "elements": [
+        {
+          "id": "q1",
+          "type": "openText",
+          "headline": { "default": "问题1" },
+          "required": true,
+          "inputType": "text"
+        }
+      ],
+      "logic": [],
+      "logicFallback": "ending1"
+    }
+  ],
+  "endings": [
+    {
+      "id": "ending1",
+      "headline": { "default": "结束" },
+      "type": "endScreen"
+    }
+  ]
+}
+```
+
+**触发的错误**：
+| 校验项 | 错误消息 |
+|--------|----------|
+| fallback 无 logic | `Fallback logic is defined without any logic in block 1` |
+
+**说明**：`logic: []` 但配置了 `logicFallback`，fallback 无意义。
+
+---
+
+#### 6.2.5 示例5：fallback 指向当前块
+
+```json
+{
+  "id": "err_fallback_to_self",
+  "name": "fallback指向当前块",
+  "blocks": [
+    {
+      "id": "block1",
+      "name": "块1",
+      "elements": [
+        {
+          "id": "q1",
+          "type": "openText",
+          "headline": { "default": "问题1" },
+          "required": true,
+          "inputType": "text"
+        }
+      ],
+      "logic": [
+        {
+          "id": "logic1",
+          "conditions": {
+            "id": "group1",
+            "connector": "and",
+            "conditions": [
+              {
+                "id": "cond1",
+                "leftOperand": { "type": "element", "value": "q1" },
+                "operator": "equals",
+                "rightOperand": { "type": "static", "value": "yes" }
+              }
+            ]
+          },
+          "actions": [
+            {
+              "id": "act1",
+              "objective": "jumpToBlock",
+              "target": "block2"
+            }
+          ]
+        }
+      ],
+      "logicFallback": "block1"
+    },
+    {
+      "id": "block2",
+      "name": "块2",
+      "elements": []
+    }
+  ],
+  "endings": []
+}
+```
+
+**触发的错误**：
+| 校验项 | 错误消息 |
+|--------|----------|
+| fallback 指向当前块 | `Fallback logic is defined with the same block in block 1` |
+
+**说明**：`logicFallback = "block1"` 与当前块 ID 相同。
+
+---
+
+#### 6.2.6 示例6：fallback 目标无效
+
+```json
+{
+  "id": "err_fallback_not_exist",
+  "name": "fallback目标不存在",
+  "blocks": [
+    {
+      "id": "block1",
+      "name": "块1",
+      "elements": [
+        {
+          "id": "q1",
+          "type": "openText",
+          "headline": { "default": "问题1" },
+          "required": true,
+          "inputType": "text"
+        }
+      ],
+      "logic": [
+        {
+          "id": "logic1",
+          "conditions": {
+            "id": "group1",
+            "connector": "and",
+            "conditions": [
+              {
+                "id": "cond1",
+                "leftOperand": { "type": "element", "value": "q1" },
+                "operator": "equals",
+                "rightOperand": { "type": "static", "value": "yes" }
+              }
+            ]
+          },
+          "actions": [
+            {
+              "id": "act1",
+              "objective": "jumpToBlock",
+              "target": "block2"
+            }
+          ]
+        }
+      ],
+      "logicFallback": "nonExistentBlock"
+    },
+    {
+      "id": "block2",
+      "name": "块2",
+      "elements": []
+    }
+  ],
+  "endings": []
+}
+```
+
+**触发的错误**：
+| 校验项 | 错误消息 |
+|--------|----------|
+| fallback 目标无效 | `Fallback block ID nonExistentBlock does not exist in block 1` |
+
+**说明**：`nonExistentBlock` 不在其他块或结束卡中。
+
+---
+
+### 6.3 错误触发条件汇总
+
+| 错误类型 | 触发条件 | 互斥情况 |
+|----------|----------|----------|
+| jumpToBlock 目标无效 | target 不在 blocks + endings 中 | 独占，触发后"跳转到当前块"不检查 |
+| 跳转到当前块 | target === 当前块ID | 前提：目标存在 |
+| 多条跳转动作 | 同一条规则中 >1 个 jumpToBlock | 可与其他错误同时触发 |
+| fallback 无 logic | logic 为空但有 logicFallback | 独占，触发后其他 fallback 校验不执行 |
+| fallback 指向当前块 | logicFallback === 当前块ID | 前提：有 logic；与"fallback 目标无效"互斥 |
+| fallback 目标无效 | logicFallback 不在合法列表中 | 前提：有 logic 且不是当前块 |
+
+---
+
+## 7. 关键文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
