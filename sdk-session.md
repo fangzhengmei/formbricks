@@ -886,11 +886,31 @@ if (pendingCount === 0) {
   }
 }
 ```
-- **关键行为**：
-  - 清除 IndexedDB 中的 UI 进度（blockId、history 等）
-  - **但仍然恢复 SurveyState 快照**（responseId、displayId、responseAcc 等）
-  - 保留待发送的响应以便同步
-- 设计意图：问卷结构可能已更新，UI 进度已失效，但已填写的数据仍然有效，需要继续发送
+
+**精确行为分析**（注意执行顺序）：
+
+1. **提前读取**：在 line 440 已经执行 `const progress = await getSurveyProgress(survey.id);`，`progress` 对象已加载到内存
+2. **清除持久化存储**：`await clearSurveyProgress(survey.id)` 从 IndexedDB 中**完全删除**该问卷的 `surveyProgress` 记录
+3. **内存态恢复**：使用内存中**已经读取的** `progress.surveyStateSnapshot` 恢复 SurveyState
+
+**三层状态的精确描述**：
+
+| 层面 | 状态 | 说明 |
+|------|------|------|
+| **持久化存储（IndexedDB）** | **已清除** | `clearSurveyProgress()` 删除了 `surveyProgress` 对象存储中的记录 |
+| **当前运行时内存** | **已恢复** | 使用已读取的 `progress` 对象恢复 SurveyState（responseId、displayId、responseAcc 等） |
+| **待发送响应（pendingResponses）** | **仍存在** | `clearSurveyProgress()` 只操作 `surveyProgress`，不影响 `pendingResponses` 对象存储 |
+
+**设计意图**：
+- 问卷结构可能已更新（例如问题被删除、block 被修改），UI 导航进度（blockId、history）已失效
+- 但用户已填写的响应数据（responseAcc 中保存的 data、ttc、variables）仍然有效
+- 通过内存恢复保留这些数据，以便继续发送到服务器
+- 清除 IndexedDB 是为了避免下次刷新时再次尝试恢复无效的 UI 进度
+
+**刷新后再刷新的行为**：
+- 第一次刷新：触发此分支，IndexedDB 已清除，但内存中用快照恢复了 SurveyState
+- 第二次刷新：`getSurveyProgress(survey.id)` 返回 `undefined`（因为 IndexedDB 已被清除）
+- 结果：**无法恢复任何进度**，SurveyState 保持初始状态，从头开始新问卷
 
 **场景 4：离线响应同步成功**
 ```typescript
@@ -944,14 +964,57 @@ if (result.success) {
 
 #### 3.5.4 状态重置/清除的对比总结
 
-| 操作 | 触发条件 | 重置内容 | 目的 |
-|------|----------|----------|------|
-| **页面刷新**（自动） | 页面重新加载 | SurveyState 重新创建，所有字段初始化为默认值 | React 组件生命周期的自然结果 |
-| **SurveyState.clear()** | 仅 `setSurveyId()` 调用时 | `responseId`, `shouldCreateResponseFromState`, `responseAcc` | 问卷编辑器中切换问卷时重置 |
-| **clearSurveyProgress(过期)** | 进度超过 24 小时 | 完全清除 IndexedDB | 过期数据清理 |
-| **clearSurveyProgress(已完成)** | 问卷已完成且无待发送响应 | 完全清除 IndexedDB | 允许用户重新开始 |
-| **clearSurveyProgress(结构变化)** | blockId 不存在 | 清除 UI 进度，但**保留 SurveyState 快照** | UI 失效但数据仍需同步 |
-| **clearSurveyProgress(同步成功)** | 所有响应发送成功 | 完全清除 IndexedDB | 会话完成清理 |
+| 操作 | 触发条件 | 重置内容（持久化层 vs 内存层） | 目的 |
+|------|----------|-------------------------------|------|
+| **页面刷新**（自动） | 页面重新加载 | 内存层：SurveyState 重新创建，所有字段初始化为默认值<br>持久化层：不受影响 | React 组件生命周期的自然结果 |
+| **SurveyState.clear()** | 仅 `setSurveyId()` 调用时 | 内存层：`responseId`, `shouldCreateResponseFromState`, `responseAcc` 重置<br>持久化层：不受影响 | 问卷编辑器中切换问卷时重置 |
+| **clearSurveyProgress(过期)** | 进度超过 24 小时 | 内存层：不受影响（保持初始状态）<br>持久化层：完全清除 IndexedDB | 过期数据清理 |
+| **clearSurveyProgress(已完成)** | 问卷已完成且无待发送响应 | 内存层：不受影响（保持初始状态）<br>持久化层：完全清除 IndexedDB | 允许用户重新开始 |
+| **clearSurveyProgress(结构变化)** | blockId 不存在 | **两步操作：**<br>1. 持久化层：`clearSurveyProgress()` 完全清除 IndexedDB<br>2. 内存层：用**已读取的快照**恢复 SurveyState | UI 失效但已填写数据仍需同步 |
+| **clearSurveyProgress(同步成功)** | 所有响应发送成功 | 内存层：不受影响<br>持久化层：完全清除 IndexedDB | 会话完成清理 |
+
+**刷新后再刷新的行为说明**：
+
+对于 **clearSurveyProgress(结构变化)** 这个分支，需要特别注意"刷新后再刷新"的行为：
+
+```
+第一次刷新
+    │
+    ▼
+┌─────────────────────────────────────┐
+│ 1. getSurveyProgress() 读取到记录   │
+│    → progress 对象加载到内存         │
+└───────────┬─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────┐
+│ 2. 发现 blockId 不存在              │
+│    → clearSurveyProgress()          │
+│    → IndexedDB 记录被删除           │
+└───────────┬─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────┐
+│ 3. 用内存中的 progress 快照恢复      │
+│    → 当前运行时可用                  │
+└───────────┬─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────┐
+│ 第二次刷新                           │
+│    │                                │
+│    ▼                                │
+│ getSurveyProgress() → undefined     │
+│ (因为 IndexedDB 已被清除)            │
+│    │                                │
+│    ▼                                │
+│ 无法恢复，从头开始                  │
+└─────────────────────────────────────┘
+```
+
+**核心要点**：
+- `clearSurveyProgress(结构变化)` 清除的是**持久化存储**，不影响**已读取到内存中的数据**
+- 第二次刷新时，由于持久化存储已被清除，无法再恢复任何进度
 
 ---
 
@@ -1061,8 +1124,9 @@ if (result.success) {
                                     │ └────────────────────────┘   │
                                     │ ┌────────────────────────┐   │
                                     │ │ blockId 不存在？        │───┼──▶ 特殊处理
-                                    │ │                        │   │     清除 UI 进度
-                                    │ │                        │   │     但保留 SurveyState 快照
+                                    │ │                        │   │     持久化层：清除 IndexedDB
+                                    │ │                        │   │     内存层：用已读取的快照恢复
+                                    │ │                        │   │     刷新后再刷新：无法恢复
                                     │ └────────────────────────┘   │
                                     └───────────┬──────────────────┘
                                                 │ 有效
@@ -1106,8 +1170,12 @@ if (result.success) {
 2. **步骤 3-5（IndexedDB 恢复）**：如果启用了离线持久化，才会从 IndexedDB 读取进度。恢复时会覆盖 SurveyState 的默认值。
 
 3. **步骤 4（无效进度处理）**：
-   - 过期或已完成 → 完全清除 IndexedDB
-   - blockId 不存在 → 清除 UI 进度，但保留 SurveyState 快照用于响应恢复
+   - **过期或已完成**：完全清除 IndexedDB，从头开始
+   - **blockId 不存在（问卷结构变化）**：
+     - 先从 IndexedDB 读取 `progress` 到内存
+     - 调用 `clearSurveyProgress()` **清除持久化存储**
+     - 使用内存中**已读取的** `progress` 快照**恢复当前运行时内存**
+     - **刷新后再刷新**：由于 IndexedDB 已清除，第二次刷新无法恢复
 
 4. **步骤 7（同步响应）**：只有在线时才会发送待处理响应，同步成功后清除 IndexedDB 进度。
 
@@ -1161,5 +1229,18 @@ Formbricks SDK 的会话状态保留机制采用 **分层架构**：
 - 支持 **离线** 环境下的问卷填写和响应暂存
 - 网络恢复后 **自动同步** 待发送响应
 - 页面关闭前 **提醒** 用户防止意外丢失
-- 问卷结构变化时 **智能降级**（保留响应数据，重置 UI 进度）
 - **IndexedDB 与内存态独立管理**：刷新时内存态必然重置，但 IndexedDB 的清除是条件判断后的主动行为
+
+### 关键设计细节
+
+**问卷结构变化时的智能处理**（精确表述）：
+
+当问卷结构变化导致保存的 `blockId` 不存在时：
+1. **持久化层**：`clearSurveyProgress()` 从 IndexedDB **完全删除**该问卷的进度记录
+2. **内存层**：使用**已读取到内存中的**快照恢复 SurveyState（responseId、displayId、responseAcc 等）
+3. **刷新后再刷新**：由于 IndexedDB 已被清除，第二次刷新无法恢复任何进度
+
+这个设计的意图是：
+- UI 导航进度（blockId、history）已失效，不应再恢复
+- 但用户已填写的响应数据（data、ttc、variables）仍然有效，需要继续同步到服务器
+- 清除 IndexedDB 是为了避免下次刷新时再次尝试恢复无效的 UI 进度
