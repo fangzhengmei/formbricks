@@ -333,11 +333,224 @@ const getLeftOperandValue = (localSurvey, data, variablesData, leftOperand, sele
 | 日期比较 | 使用 `Date.getTime()` 比较时间戳 |
 | 异常处理 | 任何错误返回 `false`（条件不满足） |
 
+### 2.6 运行时回退逻辑详解
+
+**位置**: `packages/surveys/src/components/general/survey.tsx:762-800`
+
+```typescript
+// 第一层级回退：逻辑规则匹配
+let firstJumpTarget: string | undefined;
+
+// 遍历所有逻辑规则
+for (const logic of currentBlock.logic) {
+  const result = processLogicRule(logic, firstJumpTarget, allRequiredQuestionIds);
+  firstJumpTarget = result.jumpTarget;  // 只保留第一个匹配的
+  // ...
+}
+
+// 第二层级回退：logicFallback
+if (!firstJumpTarget && currentBlock.logicFallback) {
+  firstJumpTarget = currentBlock.logicFallback;
+}
+
+// 第三层级回退：顺序下一个块
+const nextBlockId = firstJumpTarget || localSurvey.blocks[currentBlockIndex + 1]?.id;
+```
+
+**回退优先级**（从高到低）：
+
+```
+1. 第一条满足条件的逻辑规则中的 jumpToBlock 动作
+   └── 只取第一个满足条件的规则中的第一个跳转动作
+
+2. block.logicFallback（如果配置了且无逻辑规则匹配）
+   └── 适用于所有逻辑规则都不满足的场景
+
+3. localSurvey.blocks[currentBlockIndex + 1]?.id（顺序下一个）
+   └── 无任何跳转目标时的默认行为
+   └── 如果是最后一个块，则为 undefined（问卷结束）
+```
+
+**实际运行时决策流程图**：
+
+```
+用户提交块
+  ↓
+评估逻辑规则
+  ├── 规则1条件满足？
+  │   └── 是 → 执行动作，取第一个 jumpToBlock → 跳转目标确定
+  ├── 规则2条件满足？
+  │   └── 是 → 执行动作（跳转目标已确定，忽略新的 jumpToBlock）
+  ├── ...
+  └── 所有规则都不满足？
+      └── 是
+          ↓
+有配置 logicFallback？
+  ├── 是 → 使用 logicFallback 作为跳转目标
+  └── 否
+        ↓
+使用顺序下一个块
+  ├── 存在 → 跳转到下一个块
+  └── 不存在（最后一块）→ 问卷结束
+```
+
 ---
 
-## 3. 循环/死跳防护机制
+## 3. 保存校验阶段的死跳防护
 
-### 3.1 循环检测算法
+Formbricks 在问卷保存时通过多层校验拦截无效跳转配置，确保不会出现运行时死跳。
+
+### 3.1 校验时机
+
+**位置**: `packages/types/surveys/types.ts:3727-3747`
+
+校验在 `ZSurvey.superRefine` 中执行，是问卷创建/更新的必经阶段。
+
+```typescript
+const validateBlockLogic = (
+  survey: TSurvey,
+  blockIndex: number,
+  block: TSurveyBlock,
+  allElements: Map<string, { block: number; element: number; data: TSurveyElement }>
+): z.core.$ZodIssue[] => {
+  // 1. 校验 logicFallback
+  const logicFallbackIssue = validateBlockLogicFallback(survey, blockIndex, block);
+
+  if (!block.logic || block.logic.length === 0) {
+    return logicFallbackIssue ?? [];
+  }
+
+  // 2. 校验每条逻辑规则
+  const logicIssues = block.logic.map((logicItem, logicIndex) => {
+    return [
+      ...validateBlockConditions(survey, blockIndex, logicIndex, logicItem.conditions, allElements),
+      ...validateBlockActions(survey, blockIndex, logicIndex, logicItem.actions, block, allElements),
+    ];
+  });
+
+  return [...logicIssues.flat(), ...(logicFallbackIssue ?? [])];
+};
+```
+
+### 3.2 jumpToBlock 动作校验
+
+**位置**: `packages/types/surveys/types.ts:3638-3660`
+
+```typescript
+// action.objective === "jumpToBlock"
+const targetBlockId = action.target;
+const blockIds = survey.blocks.map((b) => b.id);
+const endingIds = survey.endings.map((ending) => ending.id);
+const possibleTargets = [...blockIds, ...endingIds];
+
+// 校验1：目标必须存在
+if (!possibleTargets.includes(targetBlockId)) {
+  return {
+    code: "custom",
+    message: `Conditional Logic: Block ID ${targetBlockId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+    path: ["blocks", blockIndex, "logic", logicIndex],
+  };
+}
+
+// 校验2：不能跳转到当前块
+if (targetBlockId === currentBlock.id) {
+  return {
+    code: "custom",
+    message: `Conditional Logic: Cannot jump to the current block in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+    path: ["blocks", blockIndex, "logic", logicIndex],
+  };
+}
+```
+
+### 3.3 logicFallback 校验
+
+**位置**: `packages/types/surveys/types.ts:3679-3725`
+
+```typescript
+const validateBlockLogicFallback = (
+  survey: TSurvey,
+  blockIndex: number,
+  block: TSurveyBlock
+): z.core.$ZodIssue[] | undefined => {
+  if (!block.logicFallback) return;
+
+  // 校验1：有 fallback 但无 logic 规则 → 无意义
+  if (!block.logic?.length && block.logicFallback) {
+    return [
+      {
+        code: "custom",
+        message: `Conditional Logic: Fallback logic is defined without any logic in block ${String(blockIndex + 1)}`,
+        path: ["blocks", blockIndex],
+      },
+    ];
+  }
+
+  // 校验2：fallback 不能指向当前块
+  if (block.id === block.logicFallback) {
+    return [
+      {
+        code: "custom",
+        message: `Conditional Logic: Fallback logic is defined with the same block in block ${String(blockIndex + 1)}`,
+        path: ["blocks", blockIndex],
+      },
+    ];
+  }
+
+  // 校验3：fallback 目标必须存在（其他块或结束卡）
+  const possibleFallbackIds: string[] = [];
+  survey.blocks.forEach((b, idx) => {
+    if (idx !== blockIndex) {
+      possibleFallbackIds.push(b.id);
+    }
+  });
+  survey.endings.forEach((e) => {
+    possibleFallbackIds.push(e.id);
+  });
+
+  if (!possibleFallbackIds.includes(block.logicFallback)) {
+    return [
+      {
+        code: "custom",
+        message: `Conditional Logic: Fallback block ID ${block.logicFallback} does not exist in block ${String(blockIndex + 1)}`,
+        path: ["blocks", blockIndex],
+      },
+    ];
+  }
+};
+```
+
+### 3.4 其他动作校验
+
+**位置**: `packages/types/surveys/types.ts:3666-3673`
+
+```typescript
+// 同一条逻辑规则中不能有多个 jumpToBlock 动作
+const jumpToBlockActions = actions.filter((action) => action.objective === "jumpToBlock");
+if (jumpToBlockActions.length > 1) {
+  actionIssues.push({
+    code: "custom",
+    message: `Conditional Logic: Multiple jump actions are not allowed in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+    path: ["blocks", blockIndex, "logic"],
+  });
+}
+```
+
+### 3.5 死跳防护校验清单
+
+| 校验项 | 校验内容 | 错误消息 |
+|--------|----------|----------|
+| **jumpToBlock 目标无效** | target 不在 blocks + endings 中 | `Block ID ${target} does not exist` |
+| **跳转到当前块** | target === 当前块 ID | `Cannot jump to the current block` |
+| **fallback 无 logic** | 配置了 fallback 但无逻辑规则 | `Fallback logic is defined without any logic` |
+| **fallback 指向当前块** | logicFallback === 当前块 ID | `Fallback logic is defined with the same block` |
+| **fallback 目标无效** | logicFallback 不在其他块/结束卡中 | `Fallback block ID ${target} does not exist` |
+| **多条跳转动作** | 同一条规则中有多个 jumpToBlock | `Multiple jump actions are not allowed` |
+
+---
+
+## 4. 循环/死跳防护机制
+
+### 4.1 循环检测算法
 
 Formbricks 使用 **DFS（深度优先搜索）** 算法在 **验证阶段** 检测循环。
 
@@ -409,7 +622,7 @@ export const findBlocksWithCyclicLogic = (blocks: TSurveyBlock[]): string[] => {
 };
 ```
 
-### 3.2 检测的三种路径
+### 4.2 检测的三种路径
 
 循环检测考虑 **所有可能的跳转路径**：
 
@@ -427,7 +640,7 @@ export const findBlocksWithCyclicLogic = (blocks: TSurveyBlock[]): string[] => {
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 结束卡豁免
+### 4.3 结束卡豁免
 
 **结束卡（Ending Card）不会形成循环**，因此检测时会跳过：
 
@@ -438,51 +651,32 @@ if (!blocks.find((b) => b.id === destination)) {
 }
 ```
 
-### 3.4 验证时机
-
-循环检测在 **问卷保存/验证阶段** 执行，而不是运行时。
+### 4.4 校验触发
 
 **位置**: `packages/types/surveys/types.ts:3733-3746`
 
-```typescript
-// 验证逻辑循环
-const logicIssues = validateBlockLogic(survey, blockIndex, block);
-const logicFallbackIssue = validateBlockLogicFallback(survey, blockIndex, block);
-const cyclicBlockIds = findBlocksWithCyclicLogic(survey.blocks);
-
-// 发现循环则返回错误
-if (cyclicBlockIds.includes(block.id)) {
-  return {
-    code: "custom",
-    message: `Conditional Logic: Block ${String(blockIndex + 1)} forms a cycle`,
-    path: ["blocks", blockIndex, "logic"],
-  };
-}
-```
-
-### 3.5 旧版问题级循环检测
-
-**位置**: `packages/types/surveys/validation.ts:245-301`
-
-与块级检测类似，旧版也有问题级的循环检测 `findQuestionsWithCyclicLogic`，逻辑相同。
+循环检测在问卷保存时执行，发现循环则返回错误。
 
 ---
 
-## 4. 完整示例
+## 5. 完整示例
 
-### 4.1 存储示例
+### 5.1 合法配置示例
 
 ```json
 {
+  "id": "survey_legal",
+  "name": "学生身份调查",
   "blocks": [
     {
       "id": "block1",
-      "name": "入门问题",
+      "name": "身份确认",
       "elements": [
         {
           "id": "q1",
           "type": "multipleChoiceSingle",
           "headline": { "default": "你是学生吗？" },
+          "required": true,
           "choices": [
             { "id": "yes", "label": { "default": "是" } },
             { "id": "no", "label": { "default": "不是" } }
@@ -517,55 +711,122 @@ if (cyclicBlockIds.includes(block.id)) {
     },
     {
       "id": "block2",
-      "name": "学生分支",
-      "elements": [...]
+      "name": "学生优惠",
+      "elements": [
+        {
+          "id": "q2",
+          "type": "openText",
+          "headline": { "default": "请输入你的学生证号" },
+          "required": true,
+          "inputType": "text"
+        }
+      ]
     },
     {
       "id": "block3",
-      "name": "非学生分支",
-      "elements": [...]
+      "name": "普通用户",
+      "elements": [
+        {
+          "id": "q3",
+          "type": "openText",
+          "headline": { "default": "请输入你的邮箱" },
+          "required": true,
+          "inputType": "email"
+        }
+      ]
+    }
+  ],
+  "endings": [
+    {
+      "id": "ending1",
+      "headline": { "default": "感谢参与！" },
+      "type": "endScreen"
     }
   ]
 }
 ```
 
-### 4.2 运行时流程
+**为什么合法**：
+- 所有 `jumpToBlock.target`（block2、block3）都存在
+- `logicFallback`（block3）存在且不是当前块
+- 无循环（block1 → block2/block3 → 结束，都是单向向前）
 
+### 5.2 非法配置示例（会被校验拦截）
+
+```json
+{
+  "id": "survey_illegal",
+  "name": "错误配置示例",
+  "blocks": [
+    {
+      "id": "block1",
+      "name": "问题块1",
+      "elements": [
+        {
+          "id": "q1",
+          "type": "openText",
+          "headline": { "default": "输入任意内容" },
+          "required": true,
+          "inputType": "text"
+        }
+      ],
+      "logic": [
+        {
+          "id": "logic1",
+          "conditions": {
+            "id": "group1",
+            "connector": "and",
+            "conditions": [
+              {
+                "id": "cond1",
+                "leftOperand": { "type": "element", "value": "q1" },
+                "operator": "isNotEmpty",
+                "rightOperand": { "type": "static", "value": "" }
+              }
+            ]
+          },
+          "actions": [
+            {
+              "id": "act1",
+              "objective": "jumpToBlock",
+              "target": "nonExistentBlock"
+            },
+            {
+              "id": "act2",
+              "objective": "jumpToBlock",
+              "target": "block1"
+            }
+          ]
+        }
+      ],
+      "logicFallback": "block1"
+    }
+  ],
+  "endings": []
+}
 ```
-用户选择 "是" (q1 = "yes")
-  ↓
-评估 logic1.conditions
-  ├── group1.connector = "and"
-  └── cond1: q1 equals "yes" → true
-  ↓
-条件满足，执行 actions
-  └── jumpToBlock → "block2"
-  ↓
-跳转到 block2（学生分支）
 
+**会被拦截的错误**（共 5 个）：
 
-用户选择 "不是" (q1 = "no")
-  ↓
-评估 logic1.conditions
-  └── cond1: q1 equals "yes" → false
-  ↓
-条件不满足，无 jumpTarget
-  ↓
-使用 logicFallback → "block3"
-  ↓
-跳转到 block3（非学生分支）
-```
+| 序号 | 错误类型 | 触发位置 | 错误消息 |
+|------|----------|----------|----------|
+| 1 | **jumpToBlock 目标无效** | `logic[0].actions[0].target = "nonExistentBlock"` | `Block ID nonExistentBlock does not exist in logic no: 1 of block 1` |
+| 2 | **跳转到当前块** | `logic[0].actions[1].target = "block1"` | `Cannot jump to the current block in logic no: 1 of block 1` |
+| 3 | **多条跳转动作** | `logic[0].actions` 中有 2 个 jumpToBlock | `Multiple jump actions are not allowed in logic no: 1 of block 1` |
+| 4 | **fallback 指向当前块** | `logicFallback = "block1"` | `Fallback logic is defined with the same block in block 1` |
+| 5 | **fallback 目标无效** | `logicFallback = "block1"` 不在其他块/结束卡中 | `Fallback block ID block1 does not exist in block 1` |
 
 ---
 
-## 5. 关键文件索引
+## 6. 关键文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
 | 类型定义 | `packages/types/surveys/logic.ts` |
 | 块类型定义 | `packages/types/surveys/blocks.ts` |
+| 保存校验（核心） | `packages/types/surveys/types.ts:3679-3747` |
 | 运行时评估 | `packages/surveys/src/lib/logic.ts` |
+| 问卷组件（入口） | `packages/surveys/src/components/general/survey.tsx:698-806` |
 | 循环检测 | `packages/types/surveys/blocks-validation.ts` |
-| 问卷组件（入口） | `packages/surveys/src/components/general/survey.tsx` |
 | 数据库 Schema | `packages/database/schema.prisma` |
 | 单元测试 | `packages/surveys/src/lib/logic.test.ts` |
