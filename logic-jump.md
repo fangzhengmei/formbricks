@@ -303,7 +303,7 @@ export const performActions = (survey, actions, data, calculationResults) => {
 
 **位置**: `packages/surveys/src/lib/logic.ts:206-448`
 
-`evaluateSingleCondition` 函数处理 38 种操作符的具体逻辑。
+`evaluateSingleCondition` 函数处理上述 32 种操作符的具体逻辑。
 
 #### 2.5.1 左操作数取值
 
