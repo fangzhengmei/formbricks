@@ -407,28 +407,82 @@ if (currentItem.type === CommandType.GeneralAction) {
 }
 ```
 
-#### 4.3.3 Setup 后的入队与执行顺序
+#### 4.3.3 两条路径对比：setup vs registerRouteChange
+
+| 路径 | 调用方式 | checkPageUrl 是否入队 | 说明 |
+|-----|---------|---------------------|------|
+| `setup()` | `setTimeout(() => void checkPageUrl(), 0)` | **否**（直接调用） | `checkPageUrl` 本身不入队，内部才会入队具体 action |
+| `registerRouteChange()` | `await queue.add(checkPageUrl, CommandType.GeneralAction)` | **是** | `checkPageUrl` 作为整体入队 |
+
+```typescript
+// 路径1: setup() - packages/js-core/src/index.ts:42-48
+const setup = async (setupConfig) => {
+  await queue.add(Setup.setup, CommandType.Setup, false, setupConfig);
+  await queue.wait();
+  
+  // ❌ checkPageUrl 本身不入队，直接调用
+  setTimeout(() => {
+    void checkPageUrl();  // 裸调用，没有 queue.add 包裹
+  }, 0);
+};
+
+// 路径2: registerRouteChange() - packages/js-core/src/index.ts:82-84
+const registerRouteChange = async (): Promise<void> => {
+  // ✅ checkPageUrl 作为整体入队
+  await queue.add(checkPageUrl, CommandType.GeneralAction);
+};
+```
+
+#### 4.3.4 checkPageUrl 内部真正入队的是什么
+
+`checkPageUrl` 函数**本身不是 CommandQueue 的命令**，它是一个检查函数，内部会根据 URL 匹配结果决定是否入队具体的 action：
+
+```typescript
+// packages/js-core/src/lib/survey/no-code-action.ts:122-157
+export const checkPageUrl = async (): Promise<Result<void, unknown>> => {
+  // 1. 获取 actionClasses
+  const actionClasses = appConfig.get().environment.data.actionClasses;
+  
+  // 2. 筛选 pageView 类型的 noCode action
+  const noCodePageViewActionClasses = actionClasses.filter(
+    (action) => action.type === "noCode" && action.noCodeConfig?.type === "pageView"
+  );
+  
+  // 3. 遍历检查每个 pageView action
+  for (const event of noCodePageViewActionClasses) {
+    const isValidUrl = handleUrlFilters(urlFilters, connector);
+    
+    if (isValidUrl) {
+      // 4. URL 匹配成功后，才真正入队 GeneralAction
+      await queue.add(
+        trackNoCodePageViewActionHandler,  // 具体的 handler 函数
+        CommandType.GeneralAction,          // 类型是 GeneralAction
+        true,
+        event.name                          // action 名称
+      );
+    }
+  }
+  
+  // 5. 额外检查 pageDwell（页面停留时间）
+  checkTimeOnPage(actionClasses);
+  
+  return { ok: true, data: undefined };
+};
+```
+
+**关键区别**：
+- `checkPageUrl` 是**检查器**，不是命令
+- 真正入队的是 `trackNoCodePageViewActionHandler`，类型为 `CommandType.GeneralAction`
+- 如果 URL 都不匹配，`checkPageUrl` 内部**不会入队任何东西**
+
+#### 4.3.5 Setup 后的时序（修正版）
 
 典型场景：`setup()` 后立即调用 `setUserId()`
 
 ```typescript
-// packages/js-core/src/index.ts:14-48
-const setup = async (setupConfig) => {
-  // 1. Setup 入队
-  await queue.add(Setup.setup, CommandType.Setup, false, setupConfig);
-  
-  // 2. 等待 Setup 完成
-  await queue.wait();
-  
-  // 3. 放入下一事件循环
-  setTimeout(() => {
-    void checkPageUrl();  // 内部会入队 GeneralAction
-  }, 0);
-};
-
 // 开发者代码：
 await formbricks.setup(config);
-formbricks.setUserId("user-123");  // 入队 UserAction
+formbricks.setUserId("user-123");
 ```
 
 **事件循环时序**：
@@ -437,7 +491,9 @@ formbricks.setUserId("user-123");  // 入队 UserAction
 ┌──────────────────────────────────────────────────────────────┐
 │                    当前事件循环（同步代码）                     │
 ├──────────────────────────────────────────────────────────────┤
-│  1. queue.add(Setup.setup)                                   │
+│                                                              │
+│  1. setup() 内部:                                            │
+│     queue.add(Setup.setup, CommandType.Setup)                │
 │     → queue: [Setup]                                         │
 │     → run() 启动，开始消费                                    │
 │                                                              │
@@ -453,7 +509,7 @@ formbricks.setUserId("user-123");  // 入队 UserAction
 │  5. setup() 返回                                             │
 │                                                              │
 │  6. formbricks.setUserId("user-123")                         │
-│     → queue.add(User.setUserId, UserAction)                  │
+│     → queue.add(User.setUserId, CommandType.UserAction)      │
 │     → queue: [UserAction]                                    │
 │     → run() 启动，开始消费                                    │
 │                                                              │
@@ -464,17 +520,45 @@ formbricks.setUserId("user-123");  // 入队 UserAction
 ┌──────────────────────────────────────────────────────────────┐
 │                    下一事件循环（宏任务）                       │
 ├──────────────────────────────────────────────────────────────┤
-│  1. setTimeout 的回调执行                                     │
-│     → checkPageUrl()                                         │
-│     → queue.add(checkPageUrl, GeneralAction)                 │
-│     → queue: [GeneralAction]                                 │
+│                                                              │
+│  1. setTimeout 回调执行                                       │
+│     → void checkPageUrl()                                    │
+│       → 遍历 pageView actionClasses                          │
+│       → 对匹配的 URL，内部调用 queue.add(...)                │
+│       → queue.add(trackNoCodePageViewActionHandler,          │
+│                  CommandType.GeneralAction)                  │
+│                                                              │
+│  2. 假设 URL 匹配成功:                                        │
+│     queue: [GeneralAction(trackNoCodePageViewActionHandler)] │
 │     → run() 启动（或追加到正在运行的 run()）                    │
+│                                                              │
+│  3. GeneralAction 执行前检查:                                 │
+│     → checkSetup() ✅ 通过                                   │
+│     → UpdateQueue 检查（如果有用户更新在队列中则等待）          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**实际执行顺序**：`Setup` → `UserAction(setUserId)` → `GeneralAction(checkPageUrl)`
+**实际执行顺序**：
 
-#### 4.3.4 为什么 checkPageUrl 要放在下一事件循环
+```
+Setup 执行
+    ↓
+setTimeout 注册（不执行）
+    ↓
+setup() 返回
+    ↓
+setUserId 入队 → 执行 → 完成
+    ↓
+（事件循环切换）
+    ↓
+setTimeout 回调执行 → checkPageUrl() 裸调用
+    ↓
+URL 匹配 → queue.add(trackNoCodePageViewActionHandler, GeneralAction)
+    ↓
+GeneralAction 执行（前会等待 UpdateQueue 完成）
+```
+
+#### 4.3.6 为什么 checkPageUrl 要放在下一事件循环
 
 **代码注释说得很清楚**（`packages/js-core/src/index.ts:42-47`）：
 
@@ -489,42 +573,43 @@ setTimeout(() => {
 
 **如果不放在下一事件循环会怎样？**
 
-假设 `checkPageUrl()` 同步执行：
+假设 `checkPageUrl()` 同步调用：
 
 ```typescript
 const setup = async (setupConfig) => {
   await queue.add(Setup.setup, CommandType.Setup, false, setupConfig);
   await queue.wait();
   
-  // ❌ 同步调用，立即入队
-  checkPageUrl();  // queue: [GeneralAction]
+  // ❌ 同步调用
+  void checkPageUrl();  // 内部立即入队 trackNoCodePageViewActionHandler
 };
 
 // 开发者代码：
-await formbricks.setup(config);   // setup() 内部 checkPageUrl 已入队
-formbricks.setUserId("user-123"); // 后入队
+await formbricks.setup(config);   // setup() 内部 checkPageUrl 已执行
+formbricks.setUserId("user-123"); // setUserId 后入队
 ```
 
-此时 `checkPageUrl` 先于 `setUserId` 执行，导致：
+此时 `checkPageUrl` 内部的 GeneralAction **先于** `setUserId` 入队，导致：
 
 1. **Segment 过滤不准确**：用户 ID 还未设置，无法正确判断用户所属 segment
 2. **问卷可能被错误过滤**：有 segment filters 的问卷会被提前排除
-3. **UserAction 等待链断裂**：GeneralAction 执行前会等待 UpdateQueue，但此时 setUserId 还没入队
+3. **GeneralAction 的 UpdateQueue 检查失效**：`setUserId` 还没入队，UpdateQueue 为空，GeneralAction 立即执行，不会等待用户识别完成
 
 **放在下一事件循环的好处**：
 
 ```
-setup() 完成 → 返回 → setUserId() 入队（UserAction）
-                ↓
-           事件循环切换
-                ↓
-           setTimeout 回调执行 → checkPageUrl() 入队（GeneralAction）
+当前事件循环：
+  setup() → queue.wait() 返回 → setTimeout 注册 → setup() 返回 → setUserId() 入队并执行
+
+下一事件循环：
+  setTimeout 回调 → checkPageUrl() 裸调用 → URL 匹配 → GeneralAction 入队
 ```
 
-这样 `setUserId` 始终比 `checkPageUrl` 先执行，确保：
-- 用户身份先建立
-- segment 过滤基于最新的用户状态
-- GeneralAction 执行前 UpdateQueue 有机会处理完用户属性更新
+这样保证：
+- `setUserId` 总是**先于** `checkPageUrl` 内部的 GeneralAction 入队
+- 用户身份先建立完成
+- GeneralAction 执行前，UpdateQueue 已经有机会处理完用户属性更新
+- Segment 过滤基于最新的用户状态
 
 ---
 
