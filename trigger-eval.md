@@ -342,26 +342,189 @@ onClose: closeSurvey,
 
 ### 4.3 命令队列机制
 
-为保证执行顺序和异步安全，所有操作通过 `CommandQueue` 串行执行：
+#### 4.3.1 CommandQueue 核心特性
+
+`CommandQueue`（`packages/js-core/src/lib/common/command-queue.ts:25-119`）是一个**FIFO（先进先出）串行执行队列**，不是按类型优先级排序的优先级队列。
 
 ```typescript
-// packages/js-core/src/lib/common/command-queue.ts (隐式使用)
-// 不同类型的命令优先级:
-enum CommandType {
-  Setup,        // 最高优先级：初始化
-  UserAction,   // 用户操作：setUserId, setAttributes
-  GeneralAction // 普通操作：track, checkPageUrl
+export class CommandQueue {
+  private queue: InternalQueueItem[] = [];  // 简单数组，按入队顺序消费
+  private running = false;                  // 互斥锁，确保串行执行
+
+  // 入队操作
+  public add(command, type, shouldCheckSetupFlag, ...args) {
+    this.queue.push(newItem);  // 追加到队尾
+    if (!this.running) {
+      void this.run();         // 队列为空时启动消费循环
+    }
+  }
+
+  // 消费循环
+  private async run() {
+    this.running = true;
+    while (this.queue.length > 0) {
+      const currentItem = this.queue.shift();  // 从队首取出（FIFO）
+      // ...执行命令
+    }
+    this.running = false;
+  }
 }
 ```
 
-**关键设计** (`packages/js-core/src/index.ts:42-48`):
-```javascript
-// setup() 完成后，checkPageUrl 被放入下一个事件循环
-// 确保同步调用的 setUserId() 等操作先执行
+**关键特性**：
+1. **严格串行**：`running` 标志确保同一时间只有一个命令在执行
+2. **FIFO 消费**：按 `push()` 入队顺序 `shift()` 出队，无优先级排序
+3. **批量消费**：`run()` 启动后会持续消费直到队列为空
+
+#### 4.3.2 三种 CommandType 的实际区别
+
+`CommandType` 枚举值**不用于排序**，只用于类型区分，触发不同的前置检查：
+
+```typescript
+enum CommandType {
+  Setup,        // 0 — 不检查 setup 状态
+  UserAction,   // 1 — 检查 setup 状态
+  GeneralAction // 2 — 检查 setup 状态 + 等待 UpdateQueue
+}
+```
+
+**执行时的差异**（`command-queue.ts:82-97`）：
+
+| 类型 | checkSetup | 等待 UpdateQueue | 典型命令 |
+|-----|-----------|-----------------|---------|
+| `Setup` | false | 否 | `Setup.setup()` |
+| `UserAction` | true | 否 | `User.setUserId()`, `Attribute.setAttributes()` |
+| `GeneralAction` | true | **是** | `Action.trackCodeAction()`, `checkPageUrl()` |
+
+**GeneralAction 的特殊处理**：
+```typescript
+if (currentItem.type === CommandType.GeneralAction) {
+  // 执行前先等待用户属性更新完成（确保 segment 过滤准确）
+  const updateQueue = UpdateQueue.getInstance();
+  if (!updateQueue.isEmpty()) {
+    await updateQueue.processUpdates();  // 阻塞等待
+  }
+}
+```
+
+#### 4.3.3 Setup 后的入队与执行顺序
+
+典型场景：`setup()` 后立即调用 `setUserId()`
+
+```typescript
+// packages/js-core/src/index.ts:14-48
+const setup = async (setupConfig) => {
+  // 1. Setup 入队
+  await queue.add(Setup.setup, CommandType.Setup, false, setupConfig);
+  
+  // 2. 等待 Setup 完成
+  await queue.wait();
+  
+  // 3. 放入下一事件循环
+  setTimeout(() => {
+    void checkPageUrl();  // 内部会入队 GeneralAction
+  }, 0);
+};
+
+// 开发者代码：
+await formbricks.setup(config);
+formbricks.setUserId("user-123");  // 入队 UserAction
+```
+
+**事件循环时序**：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    当前事件循环（同步代码）                     │
+├──────────────────────────────────────────────────────────────┤
+│  1. queue.add(Setup.setup)                                   │
+│     → queue: [Setup]                                         │
+│     → run() 启动，开始消费                                    │
+│                                                              │
+│  2. await queue.wait()                                       │
+│     → 阻塞，等待 run() 完成                                   │
+│                                                              │
+│  3. Setup 执行完成，queue: []                                 │
+│     → queue.wait() 返回                                      │
+│                                                              │
+│  4. setTimeout(fn, 0)                                        │
+│     → fn 被注册到宏任务队列，不立即执行                        │
+│                                                              │
+│  5. setup() 返回                                             │
+│                                                              │
+│  6. formbricks.setUserId("user-123")                         │
+│     → queue.add(User.setUserId, UserAction)                  │
+│     → queue: [UserAction]                                    │
+│     → run() 启动，开始消费                                    │
+│                                                              │
+│  7. 当前事件循环结束                                           │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    下一事件循环（宏任务）                       │
+├──────────────────────────────────────────────────────────────┤
+│  1. setTimeout 的回调执行                                     │
+│     → checkPageUrl()                                         │
+│     → queue.add(checkPageUrl, GeneralAction)                 │
+│     → queue: [GeneralAction]                                 │
+│     → run() 启动（或追加到正在运行的 run()）                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**实际执行顺序**：`Setup` → `UserAction(setUserId)` → `GeneralAction(checkPageUrl)`
+
+#### 4.3.4 为什么 checkPageUrl 要放在下一事件循环
+
+**代码注释说得很清楚**（`packages/js-core/src/index.ts:42-47`）：
+
+```typescript
+// Schedule checkPageUrl to run in the next event loop iteration.
+// This ensures that any user actions (like setUserId) called synchronously after setup()
+// will be queued BEFORE the page view actions are processed.
 setTimeout(() => {
   void checkPageUrl();
 }, 0);
 ```
+
+**如果不放在下一事件循环会怎样？**
+
+假设 `checkPageUrl()` 同步执行：
+
+```typescript
+const setup = async (setupConfig) => {
+  await queue.add(Setup.setup, CommandType.Setup, false, setupConfig);
+  await queue.wait();
+  
+  // ❌ 同步调用，立即入队
+  checkPageUrl();  // queue: [GeneralAction]
+};
+
+// 开发者代码：
+await formbricks.setup(config);   // setup() 内部 checkPageUrl 已入队
+formbricks.setUserId("user-123"); // 后入队
+```
+
+此时 `checkPageUrl` 先于 `setUserId` 执行，导致：
+
+1. **Segment 过滤不准确**：用户 ID 还未设置，无法正确判断用户所属 segment
+2. **问卷可能被错误过滤**：有 segment filters 的问卷会被提前排除
+3. **UserAction 等待链断裂**：GeneralAction 执行前会等待 UpdateQueue，但此时 setUserId 还没入队
+
+**放在下一事件循环的好处**：
+
+```
+setup() 完成 → 返回 → setUserId() 入队（UserAction）
+                ↓
+           事件循环切换
+                ↓
+           setTimeout 回调执行 → checkPageUrl() 入队（GeneralAction）
+```
+
+这样 `setUserId` 始终比 `checkPageUrl` 先执行，确保：
+- 用户身份先建立
+- segment 过滤基于最新的用户状态
+- GeneralAction 执行前 UpdateQueue 有机会处理完用户属性更新
 
 ---
 
