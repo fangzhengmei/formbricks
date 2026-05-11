@@ -96,18 +96,20 @@ interface SingleCondition {
 
 #### 1.5.3 支持的操作符
 
-共 **38 种** 操作符，分为以下几类：
+按 `packages/types/surveys/logic.ts` 中的 `ZSurveyLogicConditionsOperator` 枚举逐项核对，共 **32 种** 操作符，分为以下几类：
 
-| 分类 | 操作符 | 说明 |
-|------|--------|------|
-| 相等 | `equals`, `doesNotEqual` | 等于/不等于 |
-| 字符串 | `contains`, `doesNotContain`, `startsWith`, `doesNotStartWith`, `endsWith`, `doesNotEndWith` | 字符串包含/前缀/后缀 |
-| 数值比较 | `isGreaterThan`, `isLessThan`, `isGreaterThanOrEqual`, `isLessThanOrEqual` | 数值大于/小于 |
-| 日期比较 | `isAfter`, `isBefore` | 日期前后 |
-| 数组包含 | `includesAllOf`, `includesOneOf`, `doesNotIncludeAllOf`, `doesNotIncludeOneOf` | 数组包含关系 |
-| 状态检查 | `isSubmitted`, `isSkipped`, `isClicked`, `isNotClicked`, `isAccepted`, `isBooked`, `isPartiallySubmitted`, `isCompletelySubmitted` | 提交/跳过/点击状态 |
-| 空值检查 | `isSet`, `isNotSet`, `isEmpty`, `isNotEmpty` | 是否设置/为空 |
-| 多选 | `equalsOneOf`, `isAnyOf` | 等于多个值之一 |
+| 分类 | 操作符 | 说明 | 数量 |
+|------|--------|------|------|
+| 相等 | `equals`, `doesNotEqual` | 等于/不等于 | 2 |
+| 字符串 | `contains`, `doesNotContain`, `startsWith`, `doesNotStartWith`, `endsWith`, `doesNotEndWith` | 字符串包含/前缀/后缀 | 6 |
+| 数值比较 | `isGreaterThan`, `isLessThan`, `isGreaterThanOrEqual`, `isLessThanOrEqual` | 数值大于/小于 | 4 |
+| 日期比较 | `isAfter`, `isBefore` | 日期前后 | 2 |
+| 数组包含 | `includesAllOf`, `includesOneOf`, `doesNotIncludeAllOf`, `doesNotIncludeOneOf` | 数组包含关系 | 4 |
+| 状态检查 | `isSubmitted`, `isSkipped`, `isClicked`, `isNotClicked`, `isAccepted`, `isBooked`, `isPartiallySubmitted`, `isCompletelySubmitted` | 提交/跳过/点击状态 | 8 |
+| 空值检查 | `isSet`, `isNotSet`, `isEmpty`, `isNotEmpty` | 是否设置/为空 | 4 |
+| 多选 | `equalsOneOf`, `isAnyOf` | 等于多个值之一 | 2 |
+
+**总计**：2 + 6 + 4 + 2 + 4 + 8 + 4 + 2 = **32 种**
 
 **无需右操作数的操作符**：`isSubmitted`, `isSkipped`, `isClicked`, `isNotClicked`, `isAccepted`, `isBooked`, `isPartiallySubmitted`, `isCompletelySubmitted`, `isSet`, `isNotSet`, `isEmpty`, `isNotEmpty`
 
