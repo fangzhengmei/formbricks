@@ -28,21 +28,22 @@ access_token 加密后存储到数据库
 重定向回集成配置页面
 ```
 
-### 1.2 核心实现细节
+---
+
+### 1.2 Notion 授权实现
 
 #### 授权端点 (`apps/web/app/api/v1/integrations/notion/route.ts`)
 
 ```typescript
-// 获取授权URL
 export const GET = withV1ApiWrapper({
   handler: async ({ req, authentication }) => {
     const environmentId = req.headers.get("environmentId");
-    
+
     // 构建 OAuth 授权 URL
     const authUrl = `${NOTION_AUTH_URL}&state=${environmentId}`;
-    
+
     return { response: responses.successResponse({ authUrl }) };
-  }
+  },
 });
 ```
 
@@ -54,44 +55,363 @@ export const GET = withV1ApiWrapper({
     const queryParams = new URLSearchParams(url.split("?")[1]);
     const environmentId = queryParams.get("state");
     const code = queryParams.get("code");
-    
+
     // 1. 使用 code 换取 access_token
-    const tokenResponse = await fetch("https://api.notion.com/v1/oauth/token", {
+    const response = await fetch("https://api.notion.com/v1/oauth/token", {
       method: "POST",
-      headers: { Authorization: `Basic ${encodedCredentials}` },
+      headers: {
+        Authorization: `Basic ${Buffer.from(
+          `${NOTION_OAUTH_CLIENT_ID}:${NOTION_OAUTH_CLIENT_SECRET}`
+        ).toString("base64")}`,
+      },
       body: JSON.stringify({
         grant_type: "authorization_code",
         code,
-        redirect_uri: NOTION_REDIRECT_URI
-      })
+        redirect_uri: NOTION_REDIRECT_URI,
+      }),
     });
-    
-    const tokenData = await tokenResponse.json();
-    
+
+    const tokenData = await response.json();
+
     // 2. 加密存储敏感凭证
-    const encryptedAccessToken = symmetricEncrypt(tokenData.access_token, ENCRYPTION_KEY);
+    const encryptedAccessToken = symmetricEncrypt(
+      tokenData.access_token,
+      ENCRYPTION_KEY
+    );
     tokenData.access_token = encryptedAccessToken;
-    
+
     // 3. 存储到数据库
     await createOrUpdateIntegration(environmentId, {
       type: "notion",
       config: {
         key: tokenData,
-        data: []
-      }
+        data: [],
+      },
     });
-    
+
     // 4. 重定向回集成页面
-    return { response: Response.redirect(`${WEBAPP_URL}/environments/${environmentId}/workspace/integrations/notion`) };
-  }
+    return {
+      response: Response.redirect(
+        `${WEBAPP_URL}/environments/${environmentId}/workspace/integrations/notion`
+      ),
+    };
+  },
 });
 ```
 
-### 1.3 加密策略
+**Notion 授权特点：**
+- 使用 Basic Auth 方式在 Token 请求中传递 Client ID 和 Secret
+- Token 永不过期，无需刷新机制
+- 授权范围固定（在 Notion 开发者后台配置）
 
-- 使用 `symmetricEncrypt` 函数对 access_token 进行 AES 加密
-- 加密密钥存储在环境变量 `ENCRYPTION_KEY`
-- 数据库中只存储加密后的令牌，避免明文泄露
+---
+
+### 1.3 Airtable 授权实现（含 PKCE）
+
+#### 授权端点 (`apps/web/app/api/v1/integrations/airtable/route.ts`)
+
+```typescript
+const scope = `data.records:read data.records:write schema.bases:read schema.bases:write user.email:read`;
+
+export const GET = withV1ApiWrapper({
+  handler: async ({ req, authentication }) => {
+    const environmentId = req.headers.get("environmentId");
+
+    // PKCE: 生成 code_verifier 和 code_challenge
+    const codeVerifier = Buffer.from(
+      environmentId + authentication.user.id + environmentId
+    ).toString("base64");
+
+    const codeChallenge = crypto
+      .createHash("sha256")
+      .update(codeVerifier)
+      .digest("base64")
+      .replace(/=/g, "")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_");
+
+    // 构建授权 URL
+    const authUrl = new URL("https://airtable.com/oauth2/v1/authorize");
+    authUrl.searchParams.append("client_id", AIRTABLE_CLIENT_ID);
+    authUrl.searchParams.append(
+      "redirect_uri",
+      WEBAPP_URL + "/api/v1/integrations/airtable/callback"
+    );
+    authUrl.searchParams.append("state", environmentId);
+    authUrl.searchParams.append("scope", scope);
+    authUrl.searchParams.append("response_type", "code");
+    authUrl.searchParams.append("code_challenge_method", "S256");
+    authUrl.searchParams.append("code_challenge", codeChallenge);
+
+    return { response: responses.successResponse({ authUrl: authUrl.toString() }) };
+  },
+});
+```
+
+#### 回调处理 (`apps/web/app/api/v1/integrations/airtable/callback/route.ts`)
+
+```typescript
+export const GET = withV1ApiWrapper({
+  handler: async ({ req, authentication }) => {
+    const queryParams = new URLSearchParams(url.split("?")[1]);
+    const environmentId = queryParams.get("state");
+    const code = queryParams.get("code");
+
+    // PKCE: 重新生成 code_verifier
+    const code_verifier = Buffer.from(
+      environmentId + authentication.user.id + environmentId
+    ).toString("base64");
+
+    // 1. 使用 code 换取 access_token
+    const key = await fetchAirtableAuthToken({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: WEBAPP_URL + "/api/v1/integrations/airtable/callback",
+      client_id: AIRTABLE_CLIENT_ID,
+      code_verifier,
+    });
+
+    // 2. 获取用户邮箱
+    const email = await getEmail(key.access_token);
+
+    // 3. 存储到数据库（保留现有映射数据）
+    const existingIntegration = await getIntegrationByType(environmentId, "airtable");
+    await createOrUpdateIntegration(environmentId, {
+      type: "airtable",
+      config: {
+        key,
+        data: existingIntegration?.config?.data ?? [],
+        email,
+      },
+    });
+
+    return {
+      response: Response.redirect(
+        `${WEBAPP_URL}/environments/${environmentId}/workspace/integrations/airtable`
+      ),
+    };
+  },
+});
+```
+
+#### Token 获取与刷新 (`apps/web/lib/airtable/service.ts`)
+
+```typescript
+export const fetchAirtableAuthToken = async (formData) => {
+  const formBody = Object.keys(formData)
+    .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(formData[key])}`)
+    .join("&");
+
+  const tokenReq = await fetch("https://airtable.com/oauth2/v1/token", {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: formBody,
+    method: "POST",
+  });
+
+  const tokenRes = await tokenReq.json();
+  const { access_token, refresh_token, expires_in } = tokenRes;
+
+  // 计算过期时间
+  const expiry_date = new Date();
+  expiry_date.setSeconds(expiry_date.getSeconds() + expires_in);
+
+  return { access_token, expiry_date: expiry_date.toISOString(), refresh_token };
+};
+
+// 每次调用前自动检查并刷新 Token
+export const getAirtableToken = async (environmentId: string) => {
+  const airtableIntegration = await getIntegrationByType(environmentId, "airtable");
+  const { access_token, expiry_date, refresh_token } = airtableIntegration.config.key;
+
+  const expiryDate = new Date(expiry_date);
+  const currentDate = new Date();
+
+  // Token 即将过期，刷新
+  if (currentDate >= expiryDate) {
+    const newToken = await fetchAirtableAuthToken({
+      grant_type: "refresh_token",
+      refresh_token,
+      client_id: AIRTABLE_CLIENT_ID,
+    });
+
+    // 更新数据库中的 Token
+    await createOrUpdateIntegration(environmentId, {
+      type: "airtable",
+      config: {
+        data: airtableIntegration.config.data ?? [],
+        email: airtableIntegration.config.email ?? "",
+        key: newToken,
+      },
+    });
+
+    return newToken.access_token;
+  }
+
+  return access_token;
+};
+```
+
+**Airtable 授权特点：**
+- 使用 PKCE (Proof Key for Code Exchange) 增强安全性
+- Token 有效期较短（默认 60 分钟），需实现刷新机制
+- 支持细粒度权限控制（读写分离）
+
+---
+
+### 1.4 Google Sheets 授权实现
+
+#### 授权端点 (`apps/web/app/api/google-sheet/route.ts`)
+
+```typescript
+const scopes = [
+  "https://www.googleapis.com/auth/spreadsheets",
+  "https://www.googleapis.com/auth/userinfo.email",
+];
+
+export const GET = async (req: NextRequest) => {
+  const environmentId = req.headers.get("environmentId");
+
+  const oAuth2Client = new google.auth.OAuth2(
+    GOOGLE_SHEETS_CLIENT_ID,
+    GOOGLE_SHEETS_CLIENT_SECRET,
+    GOOGLE_SHEETS_REDIRECT_URL
+  );
+
+  const authUrl = oAuth2Client.generateAuthUrl({
+    access_type: "offline", // 必须指定以获取 refresh_token
+    scope: scopes,
+    prompt: "consent", // 强制显示同意页面，确保获取 refresh_token
+    state: environmentId,
+  });
+
+  return responses.successResponse({ authUrl });
+};
+```
+
+#### 回调处理 (`apps/web/app/api/google-sheet/callback/route.ts`)
+
+```typescript
+export const GET = async (req: Request) => {
+  const url = new URL(req.url);
+  const environmentId = url.searchParams.get("state");
+  const code = url.searchParams.get("code");
+
+  const oAuth2Client = new google.auth.OAuth2(
+    GOOGLE_SHEETS_CLIENT_ID,
+    GOOGLE_SHEETS_CLIENT_SECRET,
+    GOOGLE_SHEETS_REDIRECT_URL
+  );
+
+  // 1. 换取 Token
+  const token = await oAuth2Client.getToken(code);
+  const key = token.res.data;
+
+  // 2. 获取用户邮箱
+  oAuth2Client.setCredentials({ access_token: key.access_token });
+  const oauth2 = google.oauth2({ auth: oAuth2Client, version: "v2" });
+  const userInfo = await oauth2.userinfo.get();
+  const userEmail = userInfo.data.email;
+
+  // 3. 存储到数据库
+  const existingIntegration = await getIntegrationByType(environmentId, "googleSheets");
+  await createOrUpdateIntegration(environmentId, {
+    type: "googleSheets",
+    config: {
+      key,
+      data: existingIntegration?.config?.data ?? [],
+      email: userEmail,
+    },
+  });
+
+  return Response.redirect(
+    `${WEBAPP_URL}/environments/${environmentId}/workspace/integrations/google-sheets`
+  );
+};
+```
+
+#### Token 验证与刷新 (`apps/web/lib/googleSheet/service.ts`)
+
+```typescript
+const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 提前 5 分钟刷新
+const GOOGLE_TOKENINFO_URL = "https://www.googleapis.com/oauth2/v1/tokeninfo";
+
+// 验证 Access Token 是否有效（是否被用户撤销）
+const isAccessTokenValid = async (accessToken: string): Promise<boolean> => {
+  try {
+    const res = await fetch(`${GOOGLE_TOKENINFO_URL}?access_token=${encodeURIComponent(accessToken)}`);
+    return res.ok;
+  } catch {
+    return false;
+  }
+};
+
+const authorize = async (googleSheetIntegrationData: TIntegrationGoogleSheets) => {
+  const oAuth2Client = new google.auth.OAuth2(
+    GOOGLE_SHEETS_CLIENT_ID,
+    GOOGLE_SHEETS_CLIENT_SECRET,
+    GOOGLE_SHEETS_REDIRECT_URL
+  );
+  const key = googleSheetIntegrationData.config.key;
+
+  // 检查：Token 是否存在且未过期且未被撤销
+  const hasStoredCredentials =
+    key.access_token &&
+    key.expiry_date &&
+    key.expiry_date > Date.now() + TOKEN_EXPIRY_BUFFER_MS;
+
+  if (hasStoredCredentials && (await isAccessTokenValid(key.access_token))) {
+    oAuth2Client.setCredentials(key);
+    return oAuth2Client;
+  }
+
+  // 使用 Refresh Token 刷新
+  oAuth2Client.setCredentials({ refresh_token: key.refresh_token });
+
+  try {
+    const { credentials } = await oAuth2Client.refreshAccessToken();
+    const mergedCredentials = {
+      ...credentials,
+      refresh_token: credentials.refresh_token ?? key.refresh_token, // 保留原有 refresh_token
+    };
+
+    // 更新数据库中的 Token
+    await createOrUpdateIntegration(googleSheetIntegrationData.environmentId, {
+      type: "googleSheets",
+      config: {
+        data: googleSheetIntegrationData.config.data ?? [],
+        email: googleSheetIntegrationData.config.email ?? "",
+        key: mergedCredentials,
+      },
+    });
+
+    oAuth2Client.setCredentials(mergedCredentials);
+    return oAuth2Client;
+  } catch (error) {
+    if (isInvalidGrantError(error)) {
+      throw new AuthenticationError(GOOGLE_SHEET_INTEGRATION_INVALID_GRANT);
+    }
+    throw error;
+  }
+};
+```
+
+**Google Sheets 授权特点：**
+- 使用官方 Google API Client Library
+- `access_type: offline` 必须指定以获取 refresh_token
+- `prompt: consent` 强制显示授权页面，确保每次重新授权都能获取 refresh_token
+- 每次 API 调用前检查 Token 有效性（是否被用户撤销）
+- refresh_token 可能过期（用户 6 个月未使用时自动失效）
+
+---
+
+### 1.5 加密策略（通用）
+
+```typescript
+// 使用 AES 对称加密存储 access_token
+const encryptedAccessToken = symmetricEncrypt(tokenData.access_token, ENCRYPTION_KEY);
+
+// 数据库中只存储加密后的令牌，避免明文泄露
+```
 
 ---
 
@@ -102,13 +422,11 @@ export const GET = withV1ApiWrapper({
 #### 集成基础类型 (`packages/types/integration/shared-types.ts`)
 
 ```typescript
-// 基础集成结构
 interface ZIntegrationBase {
   id: string;
   environmentId: string;
 }
 
-// 问卷映射基础数据
 interface ZIntegrationBaseSurveyData {
   createdAt: Date;
   elementIds: string[];           // 要同步的问卷元素ID
@@ -116,13 +434,13 @@ interface ZIntegrationBaseSurveyData {
   includeHiddenFields: boolean;   // 是否包含隐藏字段
   includeMetadata: boolean;       // 是否包含元数据
   includeCreatedAt: boolean;      // 是否包含创建时间
-  elements: string;               // 元素名称
+  elements: string;               // 元素名称描述
   surveyId: string;               // 关联问卷ID
   surveyName: string;             // 问卷名称
 }
 ```
 
-#### Notion 特定配置 (`packages/types/integration/notion.ts`)
+#### Notion 特定配置
 
 ```typescript
 interface TIntegrationNotionConfigData {
@@ -137,36 +455,75 @@ interface TIntegrationNotionConfigData {
 }
 ```
 
-### 2.2 资源选择流程
+#### Airtable 特定配置
 
-#### 步骤1：获取第三方资源列表
+```typescript
+interface TIntegrationAirtableConfigData {
+  baseId: string;       // Airtable Base ID
+  tableId: string;      // Airtable Table ID
+  tableName: string;    // Table 名称
+  surveyId: string;     // 关联的问卷ID
+  surveyName: string;   // 问卷名称
+  elementIds: string[]; // 选中的问题ID列表
+  elements: string;     // 问题描述（全部问题/已选问题）
+  includeVariables: boolean;
+  includeHiddenFields: boolean;
+  includeMetadata: boolean;
+  includeCreatedAt: boolean;
+}
+```
 
-以 Notion 为例，调用 Notion Search API 获取用户有权限访问的数据库：
+#### Google Sheets 特定配置
+
+```typescript
+interface TIntegrationGoogleSheetsConfigData {
+  spreadsheetId: string;     // Google Sheets 电子表格ID
+  spreadsheetName: string;   // 表格名称
+  surveyId: string;          // 关联的问卷ID
+  surveyName: string;        // 问卷名称
+  elementIds: string[];      // 选中的问题ID列表
+  elements: string;          // 问题描述
+  includeVariables: boolean;
+  includeHiddenFields: boolean;
+  includeMetadata: boolean;
+  includeCreatedAt: boolean;
+}
+```
+
+---
+
+### 2.2 Notion 资源选择流程
+
+#### 步骤1：获取数据库列表
 
 ```typescript
 // apps/web/lib/notion/service.ts
 export const getNotionDatabases = async (environmentId: string) => {
   const notionIntegration = await getIntegrationByType(environmentId, "notion");
-  
+
   const res = await fetch("https://api.notion.com/v1/search", {
-    headers: getHeaders(notionIntegration.config),
+    headers: {
+      Authorization: `Bearer ${symmetricDecrypt(
+        notionIntegration.config.key.access_token,
+        ENCRYPTION_KEY
+      )}`,
+      "Notion-Version": "2022-06-28",
+    },
     method: "POST",
     body: JSON.stringify({
       page_size: 100,
-      filter: { value: "database", property: "object" }
-    })
+      filter: { value: "database", property: "object" },
+    }),
   });
-  
+
   return (await res.json()).results;
 };
 ```
 
-#### 步骤2：前端资源选择界面
+#### 步骤2：前端字段映射界面
 
 ```typescript
-// apps/web/app/(app)/environments/[environmentId]/workspace/integrations/notion/components/AddIntegrationModal.tsx
-
-// 1. 选择目标数据库
+// 选择数据库 -> 选择问卷 -> 字段映射
 <DropdownSelector
   label="选择 Notion 数据库"
   items={databases}
@@ -174,7 +531,6 @@ export const getNotionDatabases = async (environmentId: string) => {
   setSelectedItem={setSelectedDatabase}
 />
 
-// 2. 选择要同步的问卷
 <DropdownSelector
   label="选择问卷"
   items={surveys}
@@ -182,48 +538,176 @@ export const getNotionDatabases = async (environmentId: string) => {
   setSelectedItem={setSelectedSurvey}
 />
 
-// 3. 获取数据库字段供映射使用
+// 显示数据库现有字段，供双向映射
 const dbItems = Object.keys(selectedDatabase.properties).map(fieldKey => ({
   id: selectedDatabase.properties[fieldKey].id,
   name: selectedDatabase.properties[fieldKey].name,
   type: selectedDatabase.properties[fieldKey].type
 }));
-
-// 4. 获取问卷元素供映射使用
-const elementItems = elements.map(el => ({
-  id: el.id,
-  name: getTextContent(el.headline),
-  type: el.type
-}));
 ```
 
-### 2.3 字段映射界面
+---
+
+### 2.3 Airtable 资源选择流程
+
+#### 步骤1：获取 Base 列表
 
 ```typescript
-// MappingRow 组件实现双向映射
-{selectedDatabase && selectedSurvey && (
-  <div>
-    <Label>映射 Formbricks 字段到 Notion 属性</Label>
-    {mapping.map((m, idx) => (
-      <MappingRow
-        key={m.id}
-        idx={idx}
-        mapping={mapping}
-        setMapping={setMapping}
-        filteredElementItems={getFilteredElementItems(idx)}
-        dbItems={dbItems}
-        elementItems={elementItems}
-      />
-    ))}
-  </div>
-)}
+// apps/web/lib/airtable/service.ts
+export const getBases = async (accessToken: string) => {
+  const req = await fetch("https://api.airtable.com/v0/meta/bases", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const res = await req.json();
+  return res.bases;
+};
 ```
 
-映射验证规则：
-- 至少需要配置一组映射
-- 每个映射必须同时选择 Formbricks 字段和 Notion 字段
-- 不允许重复映射同一个字段
-- 类型兼容性检查（如日期字段只能映射到日期类型）
+#### 步骤2：获取 Base 下的 Table 列表
+
+```typescript
+// apps/web/app/api/v1/integrations/airtable/tables/route.ts
+export const GET = withV1ApiWrapper({
+  handler: async ({ req, authentication }) => {
+    const environmentId = req.headers.get("environmentId");
+    const baseId = new URLSearchParams(url.split("?")[1]).get("baseId");
+
+    // 确保使用有效的 Access Token（自动刷新）
+    const freshAccessToken = await getAirtableToken(environmentId);
+    const tables = await getTables(
+      { ...integration.config.key, access_token: freshAccessToken },
+      baseId
+    );
+
+    return { response: responses.successResponse(tables) };
+  },
+});
+```
+
+#### 步骤3：前端资源选择界面
+
+```typescript
+// 选择 Base -> 选择 Table -> 选择问卷 -> 勾选问题
+<BaseSelectDropdown
+  control={control}
+  isLoading={isLoading}
+  fetchTable={fetchTable}
+  airtableArray={airtableArray}
+  setValue={setValue}
+/>
+
+<Controller
+  control={control}
+  name="table"
+  render={({ field }) => (
+    <Select onValueChange={field.onChange}>
+      <SelectTrigger />
+      <SelectContent>
+        {tables.map((item) => (
+          <SelectItem key={item.id} value={item.id}>
+            {item.name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )}
+/>
+
+// 问题多选 + 附加选项开关
+{elements.map((element) => (
+  <ElementCheckbox element={element} selectedSurvey={selectedSurvey} field={field} />
+))}
+
+<AdditionalIntegrationSettings
+  includeVariables={includeVariables}
+  setIncludeVariables={setIncludeVariables}
+  includeHiddenFields={includeHiddenFields}
+  includeMetadata={includeMetadata}
+  setIncludeHiddenFields={setIncludeHiddenFields}
+  setIncludeMetadata={setIncludeMetadata}
+  includeCreatedAt={includeCreatedAt}
+  setIncludeCreatedAt={setIncludeCreatedAt}
+/>
+```
+
+---
+
+### 2.4 Google Sheets 资源选择流程
+
+#### 步骤1：用户输入电子表格 URL
+
+```typescript
+// 从 URL 中提取 spreadsheetId
+export const extractSpreadsheetIdFromUrl = (url: string): string => {
+  const match = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  if (!match) throw new Error("Invalid Google Sheets URL");
+  return match[1];
+};
+
+// 验证 spreadsheetId 是否有效且用户有访问权限
+export const getSpreadsheetNameById = async (
+  googleSheetIntegrationData: TIntegrationGoogleSheets,
+  spreadsheetId: string
+): Promise<string> => {
+  const authClient = await authorize(googleSheetIntegrationData);
+  const sheets = google.sheets({ version: "v4", auth: authClient });
+
+  return new Promise((resolve, reject) => {
+    sheets.spreadsheets.get({ spreadsheetId }, (err, response) => {
+      if (err) {
+        const msg = err.message.toLowerCase();
+        if (msg.includes("permission") || msg.includes("caller does not have")) {
+          reject(new OperationNotAllowedError("Insufficient permission"));
+        } else {
+          reject(err);
+        }
+        return;
+      }
+      resolve(response.data.properties.title);
+    });
+  });
+};
+```
+
+#### 步骤2：前端资源选择界面
+
+```typescript
+// 输入 Google Sheets URL -> 选择问卷 -> 勾选问题
+<Input
+  value={spreadsheetUrl}
+  onChange={(e) => setSpreadsheetUrl(e.target.value)}
+  placeholder="https://docs.google.com/spreadsheets/d/<your-spreadsheet-id>"
+/>
+
+<DropdownSelector
+  label="选择问卷"
+  items={surveys}
+  selectedItem={selectedSurvey}
+  setSelectedItem={setSelectedSurvey}
+/>
+
+// 验证 URL 有效性
+const isValid = isValidGoogleSheetsUrl(spreadsheetUrl);
+if (!isValid) {
+  throw new Error("Please enter a valid spreadsheet URL");
+}
+
+// 验证用户对表格的访问权限
+const spreadsheetName = await getSpreadsheetNameByIdAction({
+  googleSheetIntegration,
+  environmentId,
+  spreadsheetId,
+});
+```
+
+---
+
+### 2.5 映射验证规则（通用）
+
+1. 至少需要配置一组映射/选择一个问题
+2. Google Sheets 用户必须对表格有编辑权限
+3. Notion 集成必须选择类型兼容的字段（如日期→日期）
+4. Airtable 会自动创建缺失的字段（singleLineText 类型）
 
 ---
 
@@ -259,31 +743,38 @@ export const handleIntegrations = async (
 };
 ```
 
-### 3.2 数据处理流程
+---
+
+### 3.2 数据处理流程（通用）
 
 ```typescript
 const processDataForIntegration = async (
-  integrationType: TIntegrationType,
-  data: TPipelineInput,
-  survey: TSurvey,
-  includeVariables: boolean,
-  includeMetadata: boolean,
-  includeHiddenFields: boolean,
-  includeCreatedAt: boolean,
-  elementIds: string[]
+  integrationType,
+  data,
+  survey,
+  includeVariables,
+  includeMetadata,
+  includeHiddenFields,
+  includeCreatedAt,
+  elementIds
 ) => {
   // 1. 提取问卷回答
-  const { responses, elements } = await extractResponses(integrationType, data, elementIds, survey);
-  
+  const { responses, elements } = await extractResponses(
+    integrationType,
+    data,
+    elementIds,
+    survey
+  );
+
   // 2. 可选：附加元数据
   if (includeMetadata) {
     responses.push(convertMetaObjectToString(data.response.meta));
     elements.push("Metadata");
   }
-  
+
   // 3. 可选：附加变量值
   if (includeVariables) {
-    survey.variables?.forEach(variable => {
+    survey.variables.forEach((variable) => {
       const value = data.response.variables[variable.id];
       if (value !== undefined) {
         responses.push(String(value));
@@ -291,25 +782,22 @@ const processDataForIntegration = async (
       }
     });
   }
-  
+
   // 4. 可选：附加创建时间
   if (includeCreatedAt) {
     responses.push(getFormattedDateTimeString(new Date(data.response.createdAt)));
     elements.push("Created At");
   }
-  
+
   return { responses, elements };
 };
-```
 
-### 3.3 响应值提取逻辑
-
-```typescript
+// 响应值提取
 const extractResponses = async (integrationType, pipelineData, elementIds, survey) => {
   const responses = [];
   const elements = [];
   const surveyElements = getElementsFromBlocks(survey.blocks);
-  
+
   for (const elementId of elementIds) {
     // 处理隐藏字段
     if (survey.hiddenFields.fieldIds?.includes(elementId)) {
@@ -317,169 +805,330 @@ const extractResponses = async (integrationType, pipelineData, elementIds, surve
       elements.push(elementId);
       continue;
     }
-    
-    const element = surveyElements.find(q => q.id === elementId);
+
+    const element = surveyElements.find((q) => q.id === elementId);
     if (!element) continue;
-    
+
     const responseValue = pipelineData.response.data[elementId];
-    
-    // 根据问题类型处理不同的响应值
+
+    // 根据问题类型处理
     if (element.type === TSurveyElementTypeEnum.PictureSelection) {
       const selectedChoiceIds = responseValue as string[];
       const urls = element.choices
-        .filter(choice => selectedChoiceIds.includes(choice.id))
-        .map(choice => resolveStorageUrlAuto(choice.imageUrl));
+        .filter((choice) => selectedChoiceIds.includes(choice.id))
+        .map((choice) => resolveStorageUrlAuto(choice.imageUrl));
       responses.push(urls.join("\n"));
     } else if (element.type === TSurveyElementTypeEnum.FileUpload) {
       responses.push((responseValue as string[]).map(resolveStorageUrlAuto).join("; "));
     } else {
       responses.push(processResponseData(responseValue));
     }
-    
+
     elements.push(getTextContent(element.headline));
   }
-  
+
   return { responses, elements };
 };
 ```
 
-### 3.4 Notion 类型适配
+---
 
-Notion API 对不同字段类型有特定的 payload 格式要求：
-
-```typescript
-const getValue = (colType: string, value: any) => {
-  switch (colType) {
-    case "select":
-      return { name: value?.replace(/,/g, "") };
-      
-    case "multi_select":
-      return Array.isArray(value) 
-        ? value.map(v => ({ name: v.replace(/,/g, "") })) 
-        : null;
-        
-    case "title":
-      return [{ text: { content: value } }];
-      
-    case "rich_text":
-      const content = Array.isArray(value) ? value.join("\n") : value;
-      return [{ 
-        text: { 
-          content: truncateText(content, NOTION_RICH_TEXT_LIMIT) 
-        } 
-      }];
-      
-    case "checkbox":
-      return value === "accepted" || value === "clicked";
-      
-    case "date":
-      return { start: value };
-      
-    case "email":
-      return value;
-      
-    case "number":
-      return parseInt(value);
-      
-    case "phone_number":
-      return value;
-      
-    case "url":
-      return Array.isArray(value) ? value.join(", ") : value;
-      
-    default:
-      return null;
-  }
-};
-```
-
-### 3.5 同步执行
+### 3.3 Notion 写入流程
 
 ```typescript
 const handleNotionIntegration = async (integration, data, surveyData) => {
-  for (const element of integration.config.data) {
-    // 只处理匹配的问卷
-    if (element.surveyId === data.surveyId) {
+  for (const config of integration.config.data) {
+    if (config.surveyId === data.surveyId) {
       // 1. 根据映射构建 payload
-      const properties = buildNotionPayloadProperties(element.mapping, data, surveyData);
-      
+      const properties = buildNotionPayloadProperties(config.mapping, data, surveyData);
+
       // 2. 写入 Notion
-      await writeNotionData(element.databaseId, properties, integration.config);
+      await writeNotionData(config.databaseId, properties, integration.config);
     }
   }
 };
 
-// 写入 Notion API
+// Notion 类型适配
+const getValue = (colType: string, value: any) => {
+  switch (colType) {
+    case "select":
+      return { name: value?.replace(/,/g, "") };
+    case "multi_select":
+      return Array.isArray(value)
+        ? value.map((v) => ({ name: v.replace(/,/g, "") }))
+        : null;
+    case "title":
+      return [{ text: { content: value } }];
+    case "rich_text":
+      const content = Array.isArray(value) ? value.join("\n") : value;
+      return [{ text: { content: truncateText(content, 2000) } }];
+    case "checkbox":
+      return value === "accepted" || value === "clicked";
+    case "date":
+      return { start: value };
+    case "email":
+      return value;
+    case "number":
+      return parseInt(value);
+    case "phone_number":
+      return value;
+    case "url":
+      return Array.isArray(value) ? value.join(", ") : value;
+    default:
+      return null;
+  }
+};
+
+// 写入 API
 export const writeData = async (databaseId, properties, config) => {
   await fetch("https://api.notion.com/v1/pages", {
     headers: getHeaders(config),
     method: "POST",
     body: JSON.stringify({
       parent: { database_id: databaseId },
-      properties
-    })
+      properties,
+    }),
   });
 };
 ```
 
 ---
 
-## 四、架构设计总结
+### 3.4 Airtable 写入流程
 
-### 4.1 三层架构设计
+```typescript
+const handleAirtableIntegration = async (integration, data, survey) => {
+  for (const config of integration.config.data) {
+    if (config.surveyId === data.surveyId) {
+      const values = await processDataForIntegration(
+        "airtable",
+        data,
+        survey,
+        config.includeVariables,
+        config.includeMetadata,
+        config.includeHiddenFields,
+        config.includeCreatedAt,
+        config.elementIds
+      );
+      await airtableWriteData(
+        integration.config.key,
+        config,
+        values.responses,
+        values.elements
+      );
+    }
+  }
+};
+
+// Airtable 写入逻辑
+export const writeData = async (key, configData, responses, elements) => {
+  // 1. 构建记录数据
+  const recordData: Record<string, string> = {};
+  for (let i = 0; i < elements.length; i++) {
+    recordData[elements[i]] =
+      responses[i].length > AIRTABLE_MESSAGE_LIMIT
+        ? truncateText(responses[i], AIRTABLE_MESSAGE_LIMIT)
+        : responses[i];
+  }
+
+  // 2. 获取现有字段，确定需要创建的字段
+  const existingFields = await getExistingFields(key, configData.baseId, configData.tableId);
+  const fieldsToCreate = elements.filter((q) => !existingFields.has(q));
+
+  // 3. 批量创建缺失字段（带速率限制控制）
+  if (fieldsToCreate.length > 0) {
+    const DELAY_BETWEEN_REQUESTS = 250; // 4 请求/秒，低于 Airtable 5 次/秒限制
+
+    for (let i = 0; i < fieldsToCreate.length; i++) {
+      const fieldName = fieldsToCreate[i];
+      await addField(key, configData.baseId, configData.tableId, {
+        name: fieldName,
+        type: "singleLineText",
+      });
+
+      if (i < fieldsToCreate.length - 1) {
+        await delay(DELAY_BETWEEN_REQUESTS);
+      }
+    }
+
+    // 4. 等待字段创建完成（Airtable 最终一致性）
+    await waitForFieldsToExist(key, configData, fieldsToCreate);
+  }
+
+  // 5. 写入记录
+  await addRecords(key, configData.baseId, configData.tableId, recordData);
+};
+
+// 字段创建等待机制
+async function waitForFieldsToExist(key, configData, fieldNames, maxRetries = 5, intervalMs = 2000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const existingFields = await getExistingFields(key, configData.baseId, configData.tableId);
+    const missingFields = fieldNames.filter((f) => !existingFields.has(f));
+
+    if (missingFields.length === 0) return;
+
+    if (attempt < maxRetries) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+  throw new Error(`Timed out waiting for fields to exist`);
+}
+```
+
+**Airtable 写入特点：**
+- 自动创建缺失字段（统一为 singleLineText 类型）
+- 实现 API 速率限制控制
+- 处理 Airtable 最终一致性，等待字段创建完成后再写入
+
+---
+
+### 3.5 Google Sheets 写入流程
+
+```typescript
+const handleGoogleSheetsIntegration = async (integration, data, survey) => {
+  for (const config of integration.config.data) {
+    if (config.surveyId === data.surveyId) {
+      const values = await processDataForIntegration(
+        "googleSheets",
+        data,
+        survey,
+        config.includeVariables,
+        config.includeMetadata,
+        config.includeHiddenFields,
+        config.includeCreatedAt,
+        config.elementIds
+      );
+
+      await writeData(
+        integration,
+        config.spreadsheetId,
+        values.responses,
+        values.elements
+      );
+    }
+  }
+};
+
+// Google Sheets 写入逻辑
+export const writeData = async (integrationData, spreadsheetId, responses, elements) => {
+  const authClient = await authorize(integrationData);
+  const sheets = google.sheets({ version: "v4", auth: authClient });
+
+  // 截断过长文本
+  const truncatedResponses = responses.map((response) =>
+    response.length > GOOGLE_SHEET_MESSAGE_LIMIT
+      ? truncateText(response, GOOGLE_SHEET_MESSAGE_LIMIT)
+      : response
+  );
+
+  // 1. 更新表头（A1 行）
+  sheets.spreadsheets.values.update(
+    {
+      spreadsheetId,
+      range: "A1",
+      valueInputOption: "RAW",
+      resource: { values: [elements] },
+    },
+    (err) => {
+      if (err) throw new Error(`Error updating headers: ${err.message}`);
+    }
+  );
+
+  // 2. 追加数据（从 A2 开始）
+  sheets.spreadsheets.values.append(
+    {
+      spreadsheetId,
+      range: "A2",
+      valueInputOption: "RAW",
+      resource: { values: [truncatedResponses] },
+    },
+    (err) => {
+      if (err) throw new Error(`Error appending data: ${err.message}`);
+    }
+  );
+};
+```
+
+**Google Sheets 写入特点：**
+- 自动更新表头（每次同步都覆盖 A1 行）
+- 数据追加模式（新回答添加到表格底部）
+- 使用 RAW 模式写入，不进行值类型推断
+
+---
+
+## 四、三平台差异对照表
+
+| 维度 | Notion | Airtable | Google Sheets |
+|------|--------|----------|---------------|
+| **鉴权方式** | OAuth 2.0 (Basic Auth) | OAuth 2.0 + PKCE | OAuth 2.0 (Google Client Library) |
+| **Token 过期** | 永不过期 | 60 分钟，自动刷新 | 60 分钟，自动刷新 |
+| **Token 刷新** | 无需 | refresh_token | refresh_token |
+| **撤销检测** | 不检测 | 不检测 | 每次调用前检测有效性 |
+| **资源模型** | Database | Base → Table | Spreadsheet (通过 URL) |
+| **资源发现** | Search API 搜索所有数据库 | Meta API 获取所有 Base → 获取 Tables | 用户手动输入 URL |
+| **字段映射方式** | 精确字段映射（选择目标字段） | 问题标题作为列名，自动创建缺失字段 | 问题标题作为列名，自动更新表头 |
+| **自动建列** | 否（需用户预先创建） | 是（singleLineText） | 是（自动更新表头） |
+| **同步触发** | 问卷提交后 Pipeline | 问卷提交后 Pipeline | 问卷提交后 Pipeline |
+| **写入模式** | 创建新 Page | 创建新 Record | 追加新行 |
+| **类型转换** | 丰富的类型适配（10+ 种类型） | 统一文本类型 | 统一文本类型 |
+| **速率限制** | 未显式处理 | 4 请求/秒 控制 | 未显式处理 |
+| **最终一致性** | 无需处理 | 需要（等待字段创建） | 无需处理 |
+| **权限检查点** | N/A | N/A | 用户输入 URL 后验证访问权限 |
+
+---
+
+## 五、架构设计总结
+
+### 5.1 三层架构设计
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    前端 UI 层                            │
 │  AddIntegrationModal - 资源选择与映射配置               │
 │  MappingRow - 字段映射行组件                            │
+│  BaseSelectDropdown - Airtable Base 选择器              │
 └─────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────┐
 │                  API 接入层                              │
 │  /api/v1/integrations/{type} - OAuth 授权发起           │
 │  /api/v1/integrations/{type}/callback - OAuth 回调      │
+│  /api/v1/integrations/airtable/tables - 获取 Table 列表 │
 └─────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────┐
 │                 服务层与数据层                           │
-│  integration/service.ts - 集成CRUD操作                  │
+│  integration/service.ts - 集成 CRUD 操作                │
 │  notion/service.ts - Notion API 封装                    │
-│  airtable/service.ts - Airtable API 封装                │
-│  googleSheet/service.ts - Google Sheets API 封装        │
+│  airtable/service.ts - Airtable API 封装 + Token 管理   │
+│  googleSheet/service.ts - Google Sheets API + Token 管理 │
 └─────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────┐
 │                   Pipeline 执行层                        │
 │  handleIntegrations.ts - 集成同步调度                   │
-│  按映射规则转换数据 → 调用第三方API写入                 │
+│  processDataForIntegration - 通用数据处理               │
+│  平台专用 writeData - 按平台特性写入                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 关键设计决策
+### 5.2 关键设计决策
 
 | 决策点 | 方案选择 | 理由 |
 |--------|----------|------|
 | Token 存储 | 加密后存储数据库 | 符合安全规范，避免明文泄露 |
 | 触发时机 | 问卷提交后异步执行 | 不影响用户提交体验 |
-| 映射方式 | 问卷-资源双向绑定 + 字段映射 | 灵活支持多问卷同步到不同资源 |
+| 映射方式 | 问卷-资源绑定 + 字段映射 | 灵活支持多问卷同步到不同资源 |
 | 类型适配 | 平台专用转换函数 | 处理各平台 API 的格式差异 |
 | 错误处理 | 单集成失败不影响其他集成 | 保证系统容错性 |
-
-### 4.3 支持的集成类型
-
-| 平台 | 授权方式 | 目标资源 | 特色 |
-|------|----------|----------|------|
-| Notion | OAuth 2.0 | Database | 丰富的字段类型支持 |
-| Airtable | OAuth 2.0 | Base → Table | 工作空间级授权 |
-| Google Sheets | OAuth 2.0 | Spreadsheet | 电子表格原生体验 |
-| Slack | OAuth 2.0 | Channel | 实时消息通知 |
+| Token 刷新 | 按需自动刷新 | 避免用户频繁重新授权 |
+| 资源发现 | API 获取 vs 用户输入 | 适配各平台 API 能力差异 |
 
 ---
 
-## 五、开发扩展指南
+## 六、开发扩展指南
 
-### 5.1 新增集成类型步骤
+### 6.1 新增集成类型步骤
 
 1. **定义类型**：在 `packages/types/integration/` 下创建新集成的类型定义
 2. **实现 OAuth 流程**：创建授权端点和回调端点
@@ -488,10 +1137,12 @@ export const writeData = async (databaseId, properties, config) => {
 5. **同步逻辑**：在 `handleIntegrations.ts` 中添加处理函数
 6. **数据写入**：实现平台专用的 writeData 函数
 
-### 5.2 注意事项
+### 6.2 注意事项
 
 - 所有 access_token 必须加密存储
 - 实现 token 刷新机制（如 Airtable 和 Google Sheets）
 - 添加完善的错误日志
 - 考虑 API 速率限制
 - 支持用户断开集成时清理数据
+- 处理第三方平台 API 的最终一致性问题
+- 验证用户对目标资源的访问权限
