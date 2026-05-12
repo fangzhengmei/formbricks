@@ -31,12 +31,12 @@ export enum TSurveyElementTypeEnum {
 
 ### 1.2 题型类型定义
 
-**文件路径**：`packages/types/src/surveys/elements.ts`
+**文件路径**：`packages/types/surveys/elements.ts`
 
 每种题型都有对应的 Zod schema 和 TypeScript 类型定义，继承自基础元素结构：
 
 ```typescript
-// packages/types/src/surveys/elements.ts:57-70
+// packages/types/surveys/elements.ts:57-70
 export const ZSurveyElementBase = z.object({
   id: ZSurveyElementId,
   type: z.enum(TSurveyElementTypeEnum),    // 关联枚举类型
@@ -54,7 +54,7 @@ export const ZSurveyElementBase = z.object({
 每种题型扩展基础结构添加特有字段，例如矩阵题：
 
 ```typescript
-// packages/types/src/surveys/elements.ts:302-310
+// packages/types/surveys/elements.ts:302-310
 export const ZSurveyMatrixElement = ZSurveyElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Matrix),
   rows: z.array(ZSurveyMatrixElementChoice),
@@ -67,7 +67,7 @@ export const ZSurveyMatrixElement = ZSurveyElementBase.extend({
 最后通过 union 类型汇总所有题型：
 
 ```typescript
-// packages/types/src/surveys/elements.ts:366-384
+// packages/types/surveys/elements.ts:366-384
 export const ZSurveyElement = z.union([
   ZSurveyOpenTextElement,
   ZSurveyConsentElement,
@@ -178,12 +178,12 @@ value={typeof value === "number" ? value : undefined}
 
 ### 3.1 响应数据模型定义
 
-**文件路径**：`packages/types/src/responses.ts`
+**文件路径**：`packages/types/responses.ts`
 
 所有题型的答案统一存储在 `TResponseData` 对象中：
 
 ```typescript
-// packages/types/src/responses.ts:7-44
+// packages/types/responses.ts:7-44
 export const ZResponseDataValue = z
   .union([z.string(), z.number(), z.array(z.string()), z.record(z.string(), z.string())])
   .optional();
@@ -561,9 +561,9 @@ const onResponseCreateOrUpdate = useCallback(
 
 | 功能 | 文件路径 |
 |------|---------|
-| 题型枚举 | `packages/types/src/surveys/constants.ts` |
-| 题型类型定义 | `packages/types/src/surveys/elements.ts` |
-| 响应数据模型 | `packages/types/src/responses.ts` |
+| 题型枚举 | `packages/types/surveys/constants.ts` |
+| 题型类型定义 | `packages/types/surveys/elements.ts` |
+| 响应数据模型 | `packages/types/responses.ts` |
 | 题型分发器 | `packages/surveys/src/components/general/element-conditional.tsx` |
 | Block 级别提交管理 | `packages/surveys/src/components/general/block-conditional.tsx` |
 | Survey 顶层状态管理 | `packages/surveys/src/components/general/survey.tsx` |
