@@ -119,15 +119,21 @@ model Membership {
 }
 ```
 
-### 3.2 待接受成员状态 (Accepted/Pending)
+### 3.2 accepted 字段与 Pending UI 限制
 
-**状态判定逻辑**：
+**两层级的判定分离**：
+
+| 层级 | 判定逻辑 | 影响范围 |
+|------|---------|---------|
+| **后端授权层** | `accepted` 字段在 Membership 表中存在，但后端授权判定不基于此字段做拒绝 | 无权限拦截 |
+| **前端 UI 层** | `isMembershipPending = membershipRole === undefined` | 禁用部分 UI 操作 |
+
+**前端 Pending UI 限制位置**（TopControlBar.tsx:35）：
 ```typescript
-// apps/web/app/(app)/environments/[environmentId]/components/TopControlBar.tsx:35
 const isMembershipPending = membershipRole === undefined;
 ```
 
-**Pending 状态对访问的影响**：
+**Pending 状态对 UI 的影响**：
 
 | 功能 | 限制 | 代码位置 |
 |------|------|---------|
@@ -242,13 +248,14 @@ Organization
 | `readWrite` | 读写 | `hasReadWriteAccess` | 编辑问卷、创建响应 |
 | `manage` | 管理 | `hasManageAccess` | 团队权限配置、项目设置 |
 
-**权限提取函数**：
+**权限标志提取函数（精确匹配，无继承关系）**：
 ```typescript
-// apps/web/modules/ee/teams/utils/teams.ts
-export const getTeamPermissionFlags = (permission: ProjectTeamPermission | undefined) => {
-  const hasManageAccess = permission === "manage";
-  const hasReadWriteAccess = permission === "readWrite" || hasManageAccess;
-  const hasReadAccess = permission === "read" || hasReadWriteAccess;
+// apps/web/modules/ee/teams/utils/teams.ts:25-35
+export const getTeamPermissionFlags = (permissionLevel?: TTeamPermission | null) => {
+  // 三个标志为精确匹配，互斥且无继承关系
+  const hasReadAccess = permissionLevel === ZTeamPermission.enum.read;
+  const hasReadWriteAccess = permissionLevel === ZTeamPermission.enum.readWrite;
+  const hasManageAccess = permissionLevel === ZTeamPermission.enum.manage;
 
   return { hasReadAccess, hasReadWriteAccess, hasManageAccess };
 };
@@ -257,7 +264,7 @@ export const getTeamPermissionFlags = (permission: ProjectTeamPermission | undef
 **只读模式判定**：
 ```typescript
 // apps/web/modules/environments/lib/utils.ts:77
-// Member 角色且仅有 read 权限时，标记为只读模式
+// Member 角色且 hasReadAccess 为 true 时，标记为只读模式
 const isReadOnly = isMember && hasReadAccess;
 ```
 
@@ -381,13 +388,13 @@ export const getEnvironmentAuth = reactCache(async (environmentId: string) => {
   // 提取角色标志
   const { isMember, isOwner, isManager, isBilling } = getAccessFlags(currentUserMembership?.role);
 
-  // 获取项目级团队权限（关键：读取 read/readWrite/manage 权限）
+  // 获取项目级团队权限（精确匹配，三个标志互斥）
   const projectPermission = await getProjectPermissionByUserId(session.user.id, project.id);
   
-  // 转换为权限标志
+  // 转换为权限标志（精确匹配，无继承关系）
   const { hasReadAccess, hasReadWriteAccess, hasManageAccess } = getTeamPermissionFlags(projectPermission);
 
-  // 只读模式判定：Member 且仅有 read 权限
+  // 只读模式判定：Member 且 hasReadAccess 为 true
   const isReadOnly = isMember && hasReadAccess;
 
   return {
@@ -414,16 +421,23 @@ export const getEnvironmentAuth = reactCache(async (environmentId: string) => {
 - **`EnvironmentBreadcrumb.tsx`** - 环境切换面包屑
 
 ```typescript
-// 组件接收权限标志，控制 UI 显示
+// ProjectAndOrgSwitch 组件实际 Props 定义
 interface ProjectAndOrgSwitchProps {
-  isOwnerOrManager: boolean;    // 控制组织/项目管理操作
-  isMember: boolean;            // 控制只读视图
-  isBilling: boolean;           // 控制账单入口
-  isMembershipPending: boolean; // 待接受邀请状态（全部操作禁用）
-  hasReadAccess: boolean;       // 项目读权限
-  hasReadWriteAccess: boolean;  // 项目写权限
-  hasManageAccess: boolean;     // 项目管理权限
-  // ...
+  currentOrganizationId: string;
+  currentOrganizationName?: string;
+  currentProjectId?: string;
+  currentProjectName?: string;
+  currentEnvironmentId?: string;
+  environments: { id: string; type: string }[];
+  isMultiOrgEnabled: boolean;
+  organizationProjectsLimit: number;
+  isFormbricksCloud: boolean;
+  isLicenseActive: boolean;
+  isOwnerOrManager: boolean;   // 组织级：Owner 或 Manager
+  isMember: boolean;            // 组织级：Member 角色
+  isBilling: boolean;           // 组织级：Billing 角色
+  isMembershipPending: boolean; // Pending：membershipRole 为 undefined 时
+  isAccessControlAllowed: boolean;
 }
 ```
 
@@ -466,45 +480,48 @@ const isValid = await verifyPassword(credentials.password, hashToVerify);
 await applyIPRateLimit(rateLimitConfigs.auth.login);
 ```
 
-### 6.4 权限拒绝路径时序
+### 6.4 权限拒绝路径时序（按真实代码顺序）
 
 **完整的拒绝路径流程**（`getEnvironmentLayoutData` 函数中的检查顺序）：
 
 ```
 HTTP Request → URL 解析 environmentId
     ↓
-1. [认证层] Session 检查 (getServerSession)
+1. [认证层] Session 检查 (getServerSession) → 第 281-285 行
    ├─ 无 Session → AuthenticationError "Not authenticated"
    └─ 有 Session → 提取 userId
     ↓
-2. [认证层] User 存在性检查 (getUser)
+2. [认证层] userId 与会话匹配校验 → 第 288-290 行
+   ├─ 不匹配 → AuthenticationError "User ID mismatch with session"
+   └─ 匹配 → 继续
+    ↓
+3. [认证层] User 存在性检查 (getUser) → 第 293-296 行
    ├─ 无 User → AuthenticationError "Not authenticated"
    └─ 有 User → 继续
     ↓
-3. [授权层] Environment 访问检查 (hasUserEnvironmentAccess)
+4. [授权层] Environment 访问检查 (hasUserEnvironmentAccess) → 第 299-302 行
    ├─ 无访问权 → AuthorizationError "Not authorized"
    └─ 有访问权 → 继续
     ↓
-4. [数据层] Environment + Project + Organization 关联查询
-   ├─ Environment 不存在 → ResourceNotFoundError
-   ├─ Project 不存在 → ResourceNotFoundError  
-   └─ Organization 不存在 → ResourceNotFoundError
+5. [数据层] Environment + Project + Organization 关联查询 → 第 304-307 行
+   ├─ 无关联数据 → ResourceNotFoundError "Environment not found"
+   └─ 有数据 → 继续
     ↓
-5. [授权层] Membership 存在性检查（在关联查询中已过滤）
+6. [授权层] Membership 存在性检查 → 第 312-314 行
    └─ 无 Membership → AuthorizationError "Membership not found"
     ↓
-6. [授权层] 项目权限获取 (getProjectPermissionByUserId)
-   └─ 返回 read/readWrite/manage 或 undefined
+7. [授权层] 项目权限获取 (getProjectPermissionByUserId) → 第 319 行
+   └─ 返回 read/readWrite/manage 或 null
     ↓
-   ✓ 所有检查通过 → 渲染页面
+   ✓ 所有检查通过 → 返回完整数据
 ```
 
 **错误类型说明**：
 
 | 错误类型 | 触发场景 | HTTP 状态码 |
 |---------|---------|------------|
-| `AuthenticationError` | 未登录/会话无效/用户不存在 | 401 |
-| `AuthorizationError` | 无组织成员资格/无环境访问权 | 403 |
+| `AuthenticationError` | 未登录/会话无效/用户不存在/ID 不匹配 | 401 |
+| `AuthorizationError` | 无环境访问权/无组织成员资格 | 403 |
 | `ResourceNotFoundError` | Environment/Project/Organization 不存在 | 404 |
 | `ValidationError` | 输入参数格式验证失败 | 400 |
 
@@ -586,7 +603,7 @@ HTTP Request
 3.  URL 参数 environmentId → 推导 projectId → 推导 organizationId
     ↓
 4.  Membership 表查询 (userId + organizationId) → role + accepted 状态
-    ├─ Pending (accepted=false / role undefined) → 全部操作禁用
+    ├─ 前端 Pending UI：membershipRole undefined 时禁用按钮
     └─ Active → 继续角色判定
     ↓
 5.  组织角色分支：
@@ -598,7 +615,7 @@ HTTP Request
            ↓
            7.  ProjectTeam 表查询 → 获得项目权限级别 (read/readWrite/manage)
            ↓
-           8.  权限标志提取 → hasReadAccess / hasReadWriteAccess / hasManageAccess
+           8.  权限标志提取 → 精确匹配：read/readWrite/manage 三标志互斥
            ↓
            9.  只读模式判定 → isReadOnly = isMember && hasReadAccess
     ↓
@@ -619,7 +636,7 @@ HTTP Request
 | 环境权限 | `apps/web/lib/environment/auth.ts` |
 | 环境认证与权限获取 | `apps/web/modules/environments/lib/utils.ts` |
 | 成员服务 | `apps/web/lib/membership/service.ts` |
-| 团队权限工具 | `apps/web/modules/ee/teams/utils/teams.ts` |
+| 团队权限工具（精确匹配） | `apps/web/modules/ee/teams/utils/teams.ts` |
 | 数据库 Schema | `packages/database/schema.prisma` |
 | 切换组件 | `apps/web/app/(app)/environments/[environmentId]/components/` |
-| 顶层控制栏 | `apps/web/app/(app)/environments/[environmentId]/components/TopControlBar.tsx` |
+| 顶层控制栏 (Pending 判定) | `apps/web/app/(app)/environments/[environmentId]/components/TopControlBar.tsx` |
