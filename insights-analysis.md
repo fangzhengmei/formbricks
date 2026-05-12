@@ -246,23 +246,56 @@ const wasElementSeen = (response, elementId) => {
 | **首题流失数** | = `displayCount - 首题真实曝光人数`（差值口径） | = 看到首题但没走到下一题的人数（响应数据口径） |
 | **首题流失率** | = 流失数 / `displayCount`（总展示为分母） | = 流失数 / 首题真实曝光（首题曝光为分母） |
 
-#### 边界保护分支：`impressions > displayCount` 的处理
+#### 边界保护分支：真实曝光 ≥ 总展示时流失率归零
 
 ```typescript
-if (impressionsArr[0] > displayCount) {
-  dropOffPercentageArr[0] = 0;  // 保护：真实曝光 > 总展示时，流失率强制 = 0
-}
+// 第一层保护：> 的情况
+if (impressionsArr[0] > displayCount) dropOffPercentageArr[0] = 0;
+
+// 第二层判断：>= 0（包含 == 和 > 两种情况）都会归零
+dropOffPercentageArr[0] =
+  impressionsArr[0] - displayCount >= 0    // 即：impressionsArr[0] >= displayCount
+    ? 0
+    : ((displayCount - impressionsArr[0]) / displayCount) * 100 || 0;
 ```
 
-**为什么会出现这种情况？**
+**完整逻辑链**：
+
+| 条件关系 | 触发结果 |
+|----------|----------|
+| `impressions > displayCount` | 流失率 = 0% |
+| `impressions == displayCount` | 流失率 = 0% |
+| `impressions < displayCount` | 正常计算流失率 |
+
+> 💡 注意：第一层 if 其实是冗余的，第二层三元判断的 `>= 0` 已经覆盖了 `>` 和 `==` 两种情况，两层保护最终效果一致。
+
+---
+
+**为什么会出现 `>=` 的情况？**
 - 数据延迟：displayCount 统计截止时间早于响应数据统计
 - 跨天边界：部分展示归到前一天，响应归到当天
 - 统计误差：埋点与数据库计数的微小差异
+- 精确相等：极端巧合下数据完全对齐
 
-**对口径的影响**：
-- 流失数 = 负值（真实曝光 > 总展示）
-- 流失率 = 0%（避免出现负数流失率）
-- 曝光数 = 仍回填为 displayCount（口径保持一致）
+---
+
+**对口径的影响对比**：
+
+| 指标 | `impressions > displayCount` | `impressions == displayCount` | `impressions < displayCount` |
+|------|------------------------------|-------------------------------|-----------------------------|
+| 首题流失数 | 负值（异常） | = 0 | = 正值 |
+| 首题流失率 | = 0% | = 0% | 正常计算 |
+| 首题曝光数 | 回填 = displayCount | 回填 = displayCount | 回填 = displayCount |
+
+---
+
+**最小数值示例对照**
+
+| 场景 | displayCount | 首题真实曝光 | 流失数计算 | 流失率结果 | 业务解读 |
+|------|--------------|-------------|-----------|-----------|---------|
+| **Case 1：>** | 1000 | 1050 | 1000 - 1050 = -50 | 0% | 数据异常，不显示负流失 |
+| **Case 2：==** | 1000 | 1000 | 1000 - 1000 = 0 | 0% | 所有展示的人都看到了首题，完美转化 |
+| **Case 3：<** | 1000 | 850 | 1000 - 850 = 150 | 15% | 正常，15% 用户没看到首题就走了 |
 
 ---
 
