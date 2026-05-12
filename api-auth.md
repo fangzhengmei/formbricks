@@ -355,23 +355,23 @@ export const rateLimitConfigs = {
 
 ### 3.4 配置键 - Namespace - 调用位置对照表
 
-| 配置键 | Namespace（真实值） | 调用位置 |
-|-------|---------------------|---------|
-| `auth.login` | `auth:login` | next-auth 配置 |
-| `auth.signup` | `auth:signup` | `auth/signup/actions.ts:234` |
-| `auth.forgotPassword` | `auth:forgot` | `auth/forgot-password/actions.ts:21` |
-| `auth.verifyEmail` | `auth:verify` | 邮件验证流程 |
-| `api.v1` | `api:v1` | `with-api-logging.ts:74-79`, `management/me/route.ts:158,175` |
-| `api.v2` | `api:v2` | `api/v2/auth/api-wrapper.ts:125` |
-| `api.v3` | `api:v3` | `api/v3/lib/api-wrapper.ts:90-104` |
-| `api.client` | `api:client` | `with-api-logging.ts:87` |
-| `actions.emailUpdate` | `action:email` | `profile/actions.ts:41` |
-| `actions.accountDeletion` | `action:account-delete` | `DeleteAccountModal/actions.ts:36,56` |
-| `actions.surveyFollowUp` | `action:followup` | `follow-ups/lib/follow-ups.ts:196` |
-| `actions.sendLinkSurveyEmail` | `action:send-link-survey-email` | `survey/link/actions.ts:17` |
-| `actions.licenseRecheck` | `action:license-recheck` | `license-check/actions.ts:45` |
-| `storage.upload` | `storage:upload` | Storage Upload API |
-| `storage.delete` | `storage:delete` | `storage/.../route.ts:107,109` |
+| 配置键 | Namespace（真实值） | 调用位置（精确行号） |
+|-------|---------------------|---------------------|
+| `auth.login` | `auth:login` | `modules/auth/lib/authOptions.ts:191` |
+| `auth.signup` | `auth:signup` | `modules/auth/signup/actions.ts:234` |
+| `auth.forgotPassword` | `auth:forgot` | `modules/auth/forgot-password/actions.ts:21` |
+| `auth.verifyEmail` | `auth:verify` | `modules/auth/lib/authOptions.ts:381`, `modules/auth/verification-requested/actions.ts:55` |
+| `api.v1` | `api:v1` | `app/lib/api/with-api-logging.ts:74-79`, `app/api/v1/management/me/route.ts:158,175` |
+| `api.v2` | `api:v2` | `modules/api/v2/auth/api-wrapper.ts:125` |
+| `api.v3` | `api:v3` | `app/api/v3/lib/api-wrapper.ts:90-104` |
+| `api.client` | `api:client` | `app/lib/api/with-api-logging.ts:61` |
+| `actions.emailUpdate` | `action:email` | `app/(app)/environments/[environmentId]/settings/(account)/profile/actions.ts:41` |
+| `actions.accountDeletion` | `action:account-delete` | `modules/account/components/DeleteAccountModal/actions.ts:36,56` |
+| `actions.surveyFollowUp` | `action:followup` | `modules/survey/follow-ups/lib/follow-ups.ts:196` |
+| `actions.sendLinkSurveyEmail` | `action:send-link-survey-email` | `modules/survey/link/actions.ts:17` |
+| `actions.licenseRecheck` | `action:license-recheck` | `modules/ee/license-check/actions.ts:45` |
+| `storage.upload` | `storage:upload` | `app/api/v1/management/storage/route.ts:77`, `app/api/v1/client/[environmentId]/storage/route.ts:112` |
+| `storage.delete` | `storage:delete` | `app/storage/[environmentId]/[accessType]/[fileName]/route.ts:107,109` |
 
 ### 3.5 Personal Token 限流：设计方案
 
