@@ -192,18 +192,42 @@ if (!response.finished && lastSeenIdx >= 0) {
 - 每道题的流失率 = 该题流失人数 / 该题曝光人数
 - 准确反映问卷中"卡住"用户的具体位置
 
-### 欢迎卡片的特殊处理
+### 欢迎卡片的特殊校准逻辑
 
-欢迎卡片（Welcome Card）关闭时，第一题的曝光数需要特殊校准：
+欢迎卡片（Welcome Card）的开关会直接影响首题的统计口径，代码执行顺序非常关键：
 
 ```typescript
 if (!survey.welcomeCard.enabled) {
-  // 无欢迎卡时，第一题曝光数 = 问卷总展示数（displayCount）
-  impressionsArr[0] = displayCount;
-  // 流失数 = 总展示数 - 实际开始答题人数
+  // 步骤 1: 先算真实流失差值（用响应数据算出来的答题人数）
   dropOffArr[0] = displayCount - impressionsArr[0];
+  
+  // 步骤 2: 计算流失百分比，分母是 displayCount（总展示口径）
+  dropOffPercentageArr[0] = impressionsArr[0] >= displayCount
+    ? 0
+    : ((displayCount - impressionsArr[0]) / displayCount) * 100 || 0;
+  
+  // 步骤 3: 最后把首题曝光数 回填 = 问卷总展示数（展示口径对齐）
+  impressionsArr[0] = displayCount;
+} else {
+  // 有欢迎卡时，首题流失率按真实曝光口径计算
+  dropOffPercentageArr[0] = impressionsArr[0] > 0 
+    ? (dropOffArr[0] / impressionsArr[0]) * 100 
+    : 0;
 }
 ```
+
+#### 两种口径对比表
+
+| 指标 | 欢迎卡 = 关闭 | 欢迎卡 = 开启 |
+|------|--------------|--------------|
+| **首题曝光数** | = `displayCount`（问卷总展示数，展示口径） | = 真实看到首题的人数（响应数据口径） |
+| **首题流失数** | = `displayCount - 真实开始答题人数`（差值口径） | = 看到首题但没继续的人数（响应数据口径） |
+| **首题流失率** | = 流失数 / `displayCount`（总展示为分母） | = 流失数 / 首题真实曝光（首题曝光为分母） |
+
+#### 设计意图说明
+
+1. **关闭欢迎卡** = 用户一进来直接看到第一题，因此"首题曝光"等价于"问卷展示"，统计口径对齐有利于理解"展示到开始"的转化漏斗
+2. **开启欢迎卡** = 用户先看到欢迎页，点击后才到第一题，因此首题曝光需要真实统计（排除只看了欢迎页就走的人）
 
 ### 耗时（TTC）块级聚合
 
