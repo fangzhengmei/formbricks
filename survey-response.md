@@ -352,26 +352,37 @@ const ttc = initialTtc ? (finished ? calculateTtcTotal(initialTtc) : initialTtc)
 
 ## 三、下游事件分发
 
-### 3.1 分发触发时机与条件
+### 3.1 双路由事件触发矩阵
 
-**核心文件**：`apps/web/app/api/v2/client/[environmentId]/responses/route.ts`
+**核心文件**：
+- POST 创建链路：`apps/web/app/api/v2/client/[environmentId]/responses/route.ts`
+- PUT 更新链路：`apps/web/app/api/v1/client/[environmentId]/responses/[responseId]/lib/put-response-handler.ts`
+
+| 事件类型 | 触发路由 | 前置条件 | 调用位置 | 执行顺序 |
+|---------|---------|---------|---------|---------|
+| `responseCreated` | POST /api/v2/client/{envId}/responses | 答卷创建成功（无论是否 finished） | route.ts 第 245-250 行 | 第 1 个触发（创建成功后立即执行） |
+| `responseUpdated` | PUT /api/v1/client/{envId}/responses/{responseId} | 答卷更新成功（仅针对已有 responseId 的草稿） | put-response-handler.ts 第 257-262 行 | 第 1 个触发（更新成功后立即执行） |
+| `responseFinished` | POST 或 PUT | `response.finished === true` | 各自链路中的 `responseCreated`/`responseUpdated` 之后 | 第 2 个触发（有条件执行） |
+
+### 3.2 POST 创建链路事件流程
 
 ```typescript
-// 写入数据库成功后执行
-const createdResponse = await createResponseForRequest({...});
+// 位置：apps/web/app/api/v2/client/[environmentId]/responses/route.ts
 
-// ===== 事件 1：responseCreated =====
-// 触发条件：每次成功创建 Response 后（无论是否完成）
+// 1. 事务创建答卷成功
+const createdResponse = await createResponseForRequest({...});
+const { quotaFull, ...responseData } = createdResponse;
+
+// 2. 无条件触发 responseCreated
 sendToPipeline({
-  event: "responseCreated",
+  event: "responseCreated",       // 固定事件类型
   environmentId,
   surveyId: responseData.surveyId,
   response: responseData,
 });
 
-// ===== 事件 2：responseFinished =====
-// 触发条件：仅当 finished === true 时
-if (responseData.finished) {
+// 3. 条件触发 responseFinished
+if (responseData.finished) {     // 仅当 finished = true 时触发
   sendToPipeline({
     event: "responseFinished",
     environmentId,
@@ -381,11 +392,49 @@ if (responseData.finished) {
 }
 ```
 
-**关键判断条件**：
-- `responseCreated`：**每次创建都触发**（包括未完成的草稿答卷）
-- `responseFinished`：**仅在 finished = true 时触发**（用户完成整个问卷）
+**POST 链路说明**：
+- 仅存在于首次提交（前端 `responseId === null`）
+- `responseCreated` **总是触发**（包括草稿状态）
+- `responseFinished` **仅在答卷标记为完成时触发**
 
-### 3.2 sendToPipeline 实现细节
+### 3.3 PUT 更新链路事件流程
+
+```typescript
+// 位置：apps/web/app/api/v1/client/[environmentId]/responses/[responseId]/lib/put-response-handler.ts
+
+// 1. 查询现有答卷、校验问卷匹配、验证数据合法性
+const existingResponseResult = await getExistingResponse(req, responseId);
+const surveyResult = await getSurveyForResponse(...);
+const validationResult = validateUpdateRequest(...);
+
+// 2. 事务更新答卷成功
+const updatedResponseResult = await getUpdatedResponse(...);
+const { quotaFull, ...responseData } = updatedResponseResult.updatedResponse;
+
+// 3. 无条件触发 responseUpdated
+sendToPipeline({
+  event: "responseUpdated",       // 固定事件类型
+  environmentId: survey.environmentId,
+  surveyId: survey.id,
+  response: responseData,
+});
+
+// 4. 条件触发 responseFinished
+if (updatedResponse.finished) {  // 仅当本次更新将状态置为完成时
+  sendToPipeline({
+    event: "responseFinished",
+    environmentId: survey.environmentId,
+    surveyId: survey.id,
+    response: responseData,
+  });
+}
+```
+
+**PUT 链路关键校验**：
+- 前置校验：`existingResponse.finished === true` 时直接返回 400，拒绝更新已完成答卷
+- 校验失败：`getExistingResponse` 返回 404（答卷不存在）时不触发任何事件
+
+### 3.4 sendToPipeline 实现细节
 
 **核心文件**：`apps/web/app/lib/pipelines.ts`
 
