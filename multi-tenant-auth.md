@@ -18,8 +18,8 @@ Team (团队) → Project (项目)
 
 1. **组织级访问**：通过 `Membership` 表建立用户与组织的关联，带有 `role` 字段
 2. **团队级访问**：通过 `TeamUser` 表建立用户与团队的关联
-3. **项目级访问**：通过 `ProjectTeam` 表建立团队与项目的关联
-4. **环境级访问**：环境从属于项目，访问权限继承自上层
+3. **项目级访问**：通过 `ProjectTeam` 表建立团队与项目的关联，携带 `permission` 权限级别
+4. **环境级访问**：环境从属于项目，访问权限继承自上层项目权限
 
 ---
 
@@ -119,7 +119,45 @@ model Membership {
 }
 ```
 
-### 3.2 权限验证函数
+### 3.2 待接受成员状态 (Accepted/Pending)
+
+**状态判定逻辑**：
+```typescript
+// apps/web/app/(app)/environments/[environmentId]/components/TopControlBar.tsx:35
+const isMembershipPending = membershipRole === undefined;
+```
+
+**Pending 状态对访问的影响**：
+
+| 功能 | 限制 | 代码位置 |
+|------|------|---------|
+| **组织设置 - API Keys** | 完全禁用，显示 "Loading" 提示 | `organization-breadcrumb.tsx:152-156` |
+| **组织设置 - Enterprise** | 完全禁用，显示 "Loading" 提示 | `organization-breadcrumb.tsx:174-177` |
+| **项目 - 创建新项目** | 按钮禁用，显示 "Loading" 提示 | `project-breadcrumb.tsx:263-278` |
+| **项目设置 - 所有选项** | 全部禁用，显示 "Loading" 提示 | `project-breadcrumb.tsx:142-145` |
+
+**前端禁用实现模式**：
+```typescript
+// Popover + disabled 按钮组合，统一实现模式
+const disabled = isMembershipPending || isMember; // 或其他权限条件
+
+{disabled ? (
+  <Popover>
+    <PopoverTrigger asChild>
+      <button aria-disabled="true" className="cursor-not-allowed text-slate-400">
+        {label}
+      </button>
+    </PopoverTrigger>
+    <PopoverContent>
+      {isMembershipPending ? "Loading" : "Not authorized"}
+    </PopoverContent>
+  </Popover>
+) : (
+  // 正常可点击选项
+)}
+```
+
+### 3.3 权限验证函数
 
 **位置**：`apps/web/lib/organization/auth.ts`
 
@@ -163,7 +201,7 @@ if (isManager) {
 }
 ```
 
-### 3.3 工具函数：权限标志提取
+### 3.4 工具函数：权限标志提取
 
 **位置**：`apps/web/lib/membership/utils.ts`
 
@@ -194,7 +232,36 @@ Organization
          └─ Environment (development)
 ```
 
-### 4.2 环境访问判定算法
+### 4.2 项目权限级别 (ProjectTeamPermission)
+
+**三级项目权限定义**：
+
+| 权限级别 | 含义 | 对应标志 | 典型操作 |
+|---------|------|---------|---------|
+| `read` | 只读 | `hasReadAccess` | 查看问卷、查看响应数据 |
+| `readWrite` | 读写 | `hasReadWriteAccess` | 编辑问卷、创建响应 |
+| `manage` | 管理 | `hasManageAccess` | 团队权限配置、项目设置 |
+
+**权限提取函数**：
+```typescript
+// apps/web/modules/ee/teams/utils/teams.ts
+export const getTeamPermissionFlags = (permission: ProjectTeamPermission | undefined) => {
+  const hasManageAccess = permission === "manage";
+  const hasReadWriteAccess = permission === "readWrite" || hasManageAccess;
+  const hasReadAccess = permission === "read" || hasReadWriteAccess;
+
+  return { hasReadAccess, hasReadWriteAccess, hasManageAccess };
+};
+```
+
+**只读模式判定**：
+```typescript
+// apps/web/modules/environments/lib/utils.ts:77
+// Member 角色且仅有 read 权限时，标记为只读模式
+const isReadOnly = isMember && hasReadAccess;
+```
+
+### 4.3 环境访问判定算法
 
 **位置**：`apps/web/lib/environment/auth.ts:7-58`
 
@@ -219,14 +286,14 @@ export const hasUserEnvironmentAccess = async (
     }
   });
 
-  // Owner / Manager / Billing 角色直接放行
+  // Owner / Manager / Billing 角色直接放行，获得所有项目权限
   if (orgMembership?.role === "owner" || 
       orgMembership?.role === "manager" || 
       orgMembership?.role === "billing") {
     return true;
   }
 
-  // 第二步：检查团队级项目访问权
+  // 第二步：检查团队级项目访问权（仅 Member 角色需要执行此查询）
   const teamMembership = await prisma.teamUser.findFirst({
     where: {
       userId,
@@ -249,10 +316,10 @@ export const hasUserEnvironmentAccess = async (
 ```
 
 **判定优先级**：
-1. **组织角色优先**：Owner/Manager/Billing 角色自动获得所有环境访问权
-2. **团队权限补充**：普通 Member 需通过所属团队 (Team) 获得项目访问权
+1. **组织角色优先**：Owner/Manager/Billing 角色自动获得所有环境访问权，忽略团队权限
+2. **团队权限补充**：普通 Member 需通过所属团队 (Team) 获得项目访问权，具体权限级别由 ProjectTeam 表的 `permission` 字段决定
 
-### 4.3 团队与项目权限关联
+### 4.4 团队与项目权限关联
 
 ```prisma
 // 团队-用户关联
@@ -287,10 +354,57 @@ model ProjectTeam {
 // 通过 environmentId 反向推导:
 // 1. 获取 Environment → projectId
 // 2. 获取 Project → organizationId  
-// 3. 获取 Membership (userId + organizationId) → role
+// 3. 获取 Membership (userId + organizationId) → role + accepted 状态
+// 4. 获取 ProjectPermission (userId + projectId) → read/readWrite/manage 级别
 ```
 
-### 5.2 前端切换组件
+### 5.2 环境认证与权限获取
+
+**核心函数**：`getEnvironmentAuth()`
+
+```typescript
+// apps/web/modules/environments/lib/utils.ts:39-95
+export const getEnvironmentAuth = reactCache(async (environmentId: string) => {
+  // 并行获取所有基础数据
+  const [environment, project, session, organization] = await Promise.all([
+    getEnvironment(environmentId),
+    getProjectByEnvironmentId(environmentId),
+    getServerSession(authOptions),
+    getOrganizationByEnvironmentId(environmentId),
+  ]);
+
+  // 获取用户组织成员身份
+  const currentUserMembership = await getMembershipByUserIdOrganizationId(
+    session?.user.id, organization.id
+  );
+  
+  // 提取角色标志
+  const { isMember, isOwner, isManager, isBilling } = getAccessFlags(currentUserMembership?.role);
+
+  // 获取项目级团队权限（关键：读取 read/readWrite/manage 权限）
+  const projectPermission = await getProjectPermissionByUserId(session.user.id, project.id);
+  
+  // 转换为权限标志
+  const { hasReadAccess, hasReadWriteAccess, hasManageAccess } = getTeamPermissionFlags(projectPermission);
+
+  // 只读模式判定：Member 且仅有 read 权限
+  const isReadOnly = isMember && hasReadAccess;
+
+  return {
+    environment,
+    project,
+    organization,
+    session,
+    currentUserMembership,
+    projectPermission,
+    isMember, isOwner, isManager, isBilling,
+    hasReadAccess, hasReadWriteAccess, hasManageAccess,
+    isReadOnly,  // UI 层根据此标记控制编辑按钮显隐
+  };
+});
+```
+
+### 5.3 前端切换组件
 
 **位置**：`apps/web/app/(app)/environments/[environmentId]/components/`
 
@@ -305,12 +419,15 @@ interface ProjectAndOrgSwitchProps {
   isOwnerOrManager: boolean;    // 控制组织/项目管理操作
   isMember: boolean;            // 控制只读视图
   isBilling: boolean;           // 控制账单入口
-  isMembershipPending: boolean; // 待接受邀请状态
+  isMembershipPending: boolean; // 待接受邀请状态（全部操作禁用）
+  hasReadAccess: boolean;       // 项目读权限
+  hasReadWriteAccess: boolean;  // 项目写权限
+  hasManageAccess: boolean;     // 项目管理权限
   // ...
 }
 ```
 
-### 5.3 开发环境特殊处理
+### 5.4 开发环境特殊处理
 
 ```typescript
 // development 环境显示环境面包屑
@@ -328,7 +445,7 @@ const showEnvironmentBreadcrumb = currentEnvironment?.type === "development";
 **Membership 查询缓存**：
 ```typescript
 // apps/web/lib/membership/service.ts:45-47
-// 使用 React Cache 进行请求级 deduplication
+// 使用 React.cache() 进行请求级 deduplication
 const getMembershipByUserIdOrganizationIdCached = reactCache(async (...));
 ```
 
@@ -349,6 +466,54 @@ const isValid = await verifyPassword(credentials.password, hashToVerify);
 await applyIPRateLimit(rateLimitConfigs.auth.login);
 ```
 
+### 6.4 权限拒绝路径时序
+
+**完整的拒绝路径流程**（`getEnvironmentLayoutData` 函数中的检查顺序）：
+
+```
+HTTP Request → URL 解析 environmentId
+    ↓
+1. [认证层] Session 检查 (getServerSession)
+   ├─ 无 Session → AuthenticationError "Not authenticated"
+   └─ 有 Session → 提取 userId
+    ↓
+2. [认证层] User 存在性检查 (getUser)
+   ├─ 无 User → AuthenticationError "Not authenticated"
+   └─ 有 User → 继续
+    ↓
+3. [授权层] Environment 访问检查 (hasUserEnvironmentAccess)
+   ├─ 无访问权 → AuthorizationError "Not authorized"
+   └─ 有访问权 → 继续
+    ↓
+4. [数据层] Environment + Project + Organization 关联查询
+   ├─ Environment 不存在 → ResourceNotFoundError
+   ├─ Project 不存在 → ResourceNotFoundError  
+   └─ Organization 不存在 → ResourceNotFoundError
+    ↓
+5. [授权层] Membership 存在性检查（在关联查询中已过滤）
+   └─ 无 Membership → AuthorizationError "Membership not found"
+    ↓
+6. [授权层] 项目权限获取 (getProjectPermissionByUserId)
+   └─ 返回 read/readWrite/manage 或 undefined
+    ↓
+   ✓ 所有检查通过 → 渲染页面
+```
+
+**错误类型说明**：
+
+| 错误类型 | 触发场景 | HTTP 状态码 |
+|---------|---------|------------|
+| `AuthenticationError` | 未登录/会话无效/用户不存在 | 401 |
+| `AuthorizationError` | 无组织成员资格/无环境访问权 | 403 |
+| `ResourceNotFoundError` | Environment/Project/Organization 不存在 | 404 |
+| `ValidationError` | 输入参数格式验证失败 | 400 |
+
+**安全检查时序要点**：
+- **先认证，后授权**：先验证用户身份，再验证权限
+- **先轻量，后重量**：先执行简单查询（Session、User），再执行复杂关联查询
+- **失败快速返回**：任一检查失败立即抛出，不继续后续查询
+- **数据与权限分离**：权限检查通过后才获取具体业务数据
+
 ---
 
 ## 七、数据模型关系图
@@ -360,52 +525,51 @@ await applyIPRateLimit(rateLimitConfigs.auth.login);
 │  email (unique)                                         │
 │  password (bcrypt hash)                                 │
 │  twoFactorEnabled                                       │
-└─────────────┬─────────────────────────┬─────────────────┘
-              │                         │
-              │ 1:N                     │ 1:N
-              ▼                         ▼
-┌──────────────────────────┐  ┌──────────────────────────┐
-│        Membership        │  │        TeamUser          │
-│  userId + organizationId │  │  userId + teamId         │
-│  role (owner/manager/...)│  │  role (admin/contributor)│
-│  accepted (boolean)      │  └────────────┬─────────────┘
-└─────────────┬────────────┘               │
-              │ 1:1                         │
-              ▼                             │
-┌──────────────────────────┐               │
-│      Organization        │               │
-│  id                      │               │
-│  name                    │               │
-└─────────────┬────────────┘               │
-              │ 1:N                         │
-              ▼                             │
-┌──────────────────────────┐               │
-│          Team            │               │
-│  id                      │               │
-│  name                    │               │
-└─────────────┬────────────┘               │
-              │ 1:N                         │
-              ▼                             │
-┌──────────────────────────┐               │
-│       ProjectTeam        │◄──────────────┘
-│  projectId + teamId      │
-│  permission (read/...)   │
-└─────────────┬────────────┘
+└─────────────┬───────────────────────────────────┬───────┘
+              │ 1:N                               │ 1:N
+              ▼                                   ▼
+┌──────────────────────────────┐    ┌──────────────────────────┐
+│        Membership            │    │        TeamUser          │
+│  userId + organizationId     │    │  userId + teamId         │
+│  role (owner/manager/...)    │    │  role (admin/contributor)│
+│  accepted (boolean)          │    └──────────────────────────┘
+└─────────────┬────────────────┘
               │ 1:1
               ▼
-┌──────────────────────────┐
-│         Project          │
-│  id                      │
-│  name                    │
-└─────────────┬────────────┘
+┌──────────────────────────────┐
+│      Organization            │
+│  id                          │
+│  name                        │
+└─────────────┬────────────────┘
               │ 1:N
               ▼
-┌──────────────────────────┐
-│       Environment        │
-│  id                      │
-│  type (dev/prod)         │
-│  projectId               │
-└──────────────────────────┘
+┌──────────────────────────────┐
+│          Team                │
+│  id                          │
+│  name                        │
+└─────────────┬────────────────┘
+              │ 1:N
+              ▼
+┌──────────────────────────────┐
+│       ProjectTeam            │
+│  projectId + teamId          │
+│  permission: read/readWrite/manage │
+└─────────────┬────────────────┘
+              │ 1:1
+              ▼
+┌──────────────────────────────┐
+│         Project              │
+│  id                          │
+│  name                        │
+└─────────────┬────────────────┘
+              │ 1:N
+              ▼
+┌──────────────────────────────┐
+│       Environment            │
+│  id                          │
+│  type (dev/prod)             │
+│  projectId                   │
+└──────────────────────────────┘
 ```
 
 ---
@@ -421,15 +585,27 @@ HTTP Request
     ↓
 3.  URL 参数 environmentId → 推导 projectId → 推导 organizationId
     ↓
-4.  Membership 表查询 (userId + organizationId) → role
+4.  Membership 表查询 (userId + organizationId) → role + accepted 状态
+    ├─ Pending (accepted=false / role undefined) → 全部操作禁用
+    └─ Active → 继续角色判定
     ↓
-5.  权限分支：
-    ├─ [owner/manager/billing] → 直接允许
+5.  组织角色分支：
+    ├─ [owner/manager/billing] → 直接允许，获得所有项目权限
     │
-    └─ [member] → 检查 TeamUser → ProjectTeam 关联
+    └─ [member] → 进入团队权限检查
            ↓
-           ├─ 找到匹配 → 允许访问
-           └─ 无匹配 → 拒绝访问 (403)
+           6.  TeamUser 表查询 → 确认用户所属团队
+           ↓
+           7.  ProjectTeam 表查询 → 获得项目权限级别 (read/readWrite/manage)
+           ↓
+           8.  权限标志提取 → hasReadAccess / hasReadWriteAccess / hasManageAccess
+           ↓
+           9.  只读模式判定 → isReadOnly = isMember && hasReadAccess
+    ↓
+10. 最终操作授权：
+    ├─ hasManageAccess → 可配置团队权限、项目设置
+    ├─ hasReadWriteAccess → 可编辑问卷、创建响应
+    └─ hasReadAccess → 仅查看数据
 ```
 
 ---
@@ -441,6 +617,9 @@ HTTP Request
 | 认证配置 | `apps/web/modules/auth/lib/authOptions.ts` |
 | 组织权限 | `apps/web/lib/organization/auth.ts` |
 | 环境权限 | `apps/web/lib/environment/auth.ts` |
+| 环境认证与权限获取 | `apps/web/modules/environments/lib/utils.ts` |
 | 成员服务 | `apps/web/lib/membership/service.ts` |
+| 团队权限工具 | `apps/web/modules/ee/teams/utils/teams.ts` |
 | 数据库 Schema | `packages/database/schema.prisma` |
 | 切换组件 | `apps/web/app/(app)/environments/[environmentId]/components/` |
+| 顶层控制栏 | `apps/web/app/(app)/environments/[environmentId]/components/TopControlBar.tsx` |
