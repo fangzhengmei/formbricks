@@ -1,10 +1,17 @@
 # Formbricks 邮件发送管道架构
 
+> **分析范围说明**: 本报告的"邮件链路内"特指邮件发送相关的代码范围：
+> - ✅ `apps/web/modules/email/` - 邮件发送核心模块
+> - ✅ `packages/email/` - 邮件模板渲染包  
+> - ✅ `apps/web/modules/survey/follow-ups/lib/email.ts` - Follow-up 邮件发送逻辑
+> - ✅ 各触发点的邮件发送调用（如验证邮件、通知邮件）
+> - ❌ 全仓库其他模块的通用重试/限流不算作邮件链路的实现
+
 ---
 
 ## 0. Provider 与可切换入口状态确认
 
-### 默认 Provider: SMTP (Nodemailer) ✅ 已实现
+### 默认 Provider: SMTP (Nodemailer) ✅ 邮件链路内已实现
 
 **位置**: `apps/web/modules/email/index.tsx:71-107`
 
@@ -26,12 +33,6 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
 };
 ```
 
-**配置项** (环境变量):
-- `SMTP_HOST`, `SMTP_PORT` - SMTP 服务器配置
-- `SMTP_SECURE_ENABLED`, `SMTP_AUTHENTICATED` - TLS/认证开关
-- `SMTP_USER`, `SMTP_PASSWORD` - 凭据
-- `MAIL_FROM`, `MAIL_FROM_NAME` - 发件人
-
 **证据**:
 - `apps/web/modules/email/index.tsx:1` - `import { createTransport } from "nodemailer"`
 - `apps/web/modules/email/index.tsx:23-36` - 所有 SMTP_* 常量导入
@@ -39,21 +40,22 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
 
 ---
 
-### Resend Provider ❌ 未实现
+### Resend Provider ❌ 邮件链路内未实现
 
 **证据**:
-- 整个代码库**不存在** `resend` 或 `Resend` 关键字的导入/调用（邮件模块内 0 匹配）
+- `apps/web/modules/email/` 目录内 **0 匹配** `resend` / `Resend` 关键字
+- `packages/email/` 目录内 **0 匹配** `resend` / `Resend` 关键字
 - 不存在 `import { Resend } from 'resend'` 或类似 SDK 引入
-- 不存在任何 Resend API 调用代码
-- `packages/email/package.json` 无 `resend` 依赖
-- `apps/web/package.json` 无 `resend` 依赖
+- 邮件发送模块无任何邮件 Provider 抽象或多实现结构
+
+> **边界说明**: 仓内其他模块可能有不同的 Provider 实现，但**邮件链路内**只有 SMTP。
 
 ---
 
-### 可切换 Provider 入口 ❌ 未实现
+### 可切换 Provider 入口 ❌ 邮件链路内未实现
 
 **证据**:
-- 全代码库**不存在** `EMAIL_PROVIDER`、`emailProvider`、`MAIL_PROVIDER` 等配置变量
+- `apps/web/modules/email/` 内无 `EMAIL_PROVIDER`、`emailProvider` 等配置变量
 - `sendEmail` 函数（`index.tsx:71`）**只有** SMTP 单一路径实现
 - 无 switch/case 或策略模式路由逻辑
 - 无邮件 Provider 抽象接口或多实现结构
@@ -120,14 +122,7 @@ if (event === "responseFinished") {
 
   // 并发发送通知邮件
   const emailPromises = usersWithNotifications.map((user) =>
-    sendResponseFinishedEmail(
-      user.email,
-      user.locale,
-      environmentId,
-      survey,
-      response,
-      responseCount
-    ).catch((error) => {
+    sendResponseFinishedEmail(...).catch((error) => {
       logger.error({ error, userEmail: user.email }, `Failed to send email to ${user.email}`);
     })
   );
@@ -184,7 +179,6 @@ export const sendFollowUpsForResponse = async (
 
   // 3. 处理每个 follow-up 配置
   const followUpPromises = survey.followUps.map(async (followUp): Promise<FollowUpResult> => {
-    const { trigger } = followUp;
     if (trigger.properties?.endingIds && !endingIds.includes(response.endingId)) {
       return { followUpId: followUp.id, status: "skipped" };
     }
@@ -279,7 +273,7 @@ export const VerificationEmail = ({ t, verifyLink, verificationRequestLink, ...l
 
 ---
 
-### 2.3 国际化 (i18n) 注入 ✅ 已实现
+### 2.3 国际化 (i18n) 注入 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/modules/email/index.tsx` 内所有 `send*Email` 函数
 
@@ -306,7 +300,7 @@ export const sendVerificationEmail = async ({ locale, ... }) => {
 
 ---
 
-### 2.4 法律链接自动注入 ✅ 已实现
+### 2.4 法律链接自动注入 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/modules/email/index.tsx:56-61`
 
@@ -328,7 +322,7 @@ const legalProps: TEmailTemplateLegalProps = {
 
 ## 3. 发送适配 (Sending Adapter)
 
-### 3.1 SMTP 发送流程 ✅ 已实现
+### 3.1 SMTP 发送流程 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/modules/email/index.tsx:71-107`
 
@@ -380,7 +374,7 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
 
 ---
 
-### 3.2 各类型邮件发送入口列表 ✅ 已实现
+### 3.2 各类型邮件发送入口列表 ✅ 邮件链路内已实现
 
 | 邮件类型 | 入口函数 | 代码位置 |
 |---------|---------|---------|
@@ -404,7 +398,7 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
 
 ## 4. 失败处理 (Failure Handling)
 
-### 4.1 Promise.allSettled 批量容错 ✅ 已实现
+### 4.1 Promise.allSettled 批量容错 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/app/api/(internal)/pipeline/route.ts:285`
 
@@ -426,20 +420,13 @@ results.forEach((result) => {
 
 ---
 
-### 4.2 单个 Promise .catch() 日志记录 ✅ 已实现
+### 4.2 单个 Promise .catch() 日志记录 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/app/api/(internal)/pipeline/route.ts:237-251`
 
 ```typescript
 const emailPromises = usersWithNotifications.map((user) =>
-  sendResponseFinishedEmail(
-    user.email,
-    user.locale,
-    environmentId,
-    survey,
-    response,
-    responseCount
-  ).catch((error) => {
+  sendResponseFinishedEmail(...).catch((error) => {
     logger.error(
       { error, url: request.url, userEmail: user.email },
       `Failed to send email to ${user.email}`
@@ -456,7 +443,7 @@ const emailPromises = usersWithNotifications.map((user) =>
 
 ---
 
-### 4.3 Follow-up 邮件的 Result 模式 ✅ 已实现
+### 4.3 Follow-up 邮件的 Result 模式 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/modules/survey/follow-ups/lib/follow-ups.ts:20-140`
 
@@ -486,7 +473,7 @@ const evaluateFollowUp = async (...): Promise<FollowUpResult> => {
 
 ---
 
-### 4.4 SMTP 配置缺失时静默跳过 ✅ 已实现
+### 4.4 SMTP 配置缺失时静默跳过 ✅ 邮件链路内已实现
 
 **位置**: `apps/web/modules/email/index.tsx:72-75`
 
@@ -504,33 +491,36 @@ if (!IS_SMTP_CONFIGURED) {
 
 ---
 
-### 4.5 自动失败重试 ❌ 未实现
+### 4.5 自动失败重试 ❌ 邮件链路内未实现
 
 **证据**:
-- 全代码库**不存在** `withRetry`、`retry`、`retryAsync`、`attemptRetry` 等重试函数
-- 无 `p-retry`、`@lifeomic/attempt`、`async-retry` 等重试库的导入
+- `apps/web/modules/email/` 目录内 **0 匹配** `retry` / `Retry` 关键字
+- `packages/email/` 目录内 **0 匹配** `retry` / `Retry` 关键字
+- `apps/web/modules/survey/follow-ups/lib/email.ts` **0 匹配** `retry` 关键字
+- 无 `withRetry`、`retry`、`retryAsync` 等重试函数定义或调用
 - `sendEmail` 函数（`index.tsx:71`）异常直接抛出，无循环重试逻辑
 - 无 `maxRetries`、`retryDelay`、`exponentialBackoff` 等重试配置常量
 - **所有** `send*Email` 函数调用后均无重试包装
 
-**注**：仅有的"重发"是业务层面手动触发（非失败自动重试）：
-- `resendInvite`（组织邀请）：用户点击"重新发送"按钮触发，非失败自动重试
-- `resendVerificationEmailAction`（验证邮件）：用户点击触发，非失败自动重试
+> **边界说明**: 仓内其他模块（如 API 客户端、任务队列）可能有重试机制，但**邮件链路内**无自动重试逻辑。仅有的"重发"是业务层面手动触发（如 `resendInvite`、`resendVerificationEmailAction`），由用户主动点击触发，**不是**发送失败后的自动重试。
 
 ---
 
-### 4.6 死信队列/补偿机制 ❌ 未实现
+### 4.6 死信队列/补偿机制 ❌ 邮件链路内未实现
 
 **证据**:
+- `apps/web/modules/email/` 目录内 **0 匹配** `deadletter` / `dlq` / `compensat` 关键字
 - 无邮件发送状态持久化表（无 `email_logs`、`email_queue` 等表定义）
 - 无补偿任务调度逻辑
 - 无死信队列处理代码
+
+> **边界说明**: 仓内其他模块（如任务队列系统）可能有 DLQ 实现，但**邮件链路内**无补偿/死信机制。
 
 ---
 
 ## 5. 限流 (Rate Limiting)
 
-### 5.1 限流核心实现 ✅ 已实现
+### 5.1 限流核心实现 ✅ 仓内通用模块实现（邮件链路调用）
 
 **算法**: **固定时间窗口计数**（Fixed Window Counter）
 
@@ -587,7 +577,7 @@ export const checkRateLimit = async (
 - **窗口类型**: 固定时间窗口（非滑动窗口）
 - **计数方式**: 每个时间窗口使用独立的 Redis key（嵌入 `windowStart`）
 - **原子性**: Lua 脚本保证 `INCR` + `EXPIRE` 原子操作，防止多 Pod 竞态
-- **窗口边界**: `windowStart = floor(timestamp / interval) * interval`，与滑动窗口算法有本质区别
+- **窗口边界**: `windowStart = floor(timestamp / interval) * interval`
 
 **关键特性**:
 - **失效开放**: Redis 不可用时跳过限流，保证系统可用性
@@ -598,11 +588,12 @@ export const checkRateLimit = async (
 - `apps/web/modules/core/rate-limit/rate-limit.ts:36` - `windowStart` 固定分桶计算
 - `apps/web/modules/core/rate-limit/rate-limit.ts:37` - key 嵌入 `windowStart`
 - `apps/web/modules/core/rate-limit/rate-limit.ts:46-61` - Lua 脚本仅执行 INCR + 条件 EXPIRE
-- 无滑动窗口所需的历史窗口清理、多窗口加权计算等逻辑
+
+> **边界说明**: 限流器本身是 `modules/core/` 下的通用模块，**不属于邮件链路专用**，但邮件链路的触发点确实调用了该限流器。
 
 ---
 
-### 5.2 限流配置 ✅ 已实现
+### 5.2 限流配置 ✅ 仓内通用模块实现（邮件链路使用）
 
 **位置**: `apps/web/modules/core/rate-limit/rate-limit-configs.ts`
 
@@ -635,10 +626,10 @@ export const rateLimitConfigs = {
 ```
 
 **邮件相关限流项**:
-- `auth.verifyEmail`: 10 次/小时
-- `auth.forgotPassword`: 5 次/小时
-- `actions.surveyFollowUp`: 50 次/小时
-- `actions.sendLinkSurveyEmail`: 10 次/小时
+- `auth.verifyEmail`: 10 次/小时（验证邮件）
+- `auth.forgotPassword`: 5 次/小时（密码重置邮件）
+- `actions.surveyFollowUp`: 50 次/小时（Follow-up 邮件）
+- `actions.sendLinkSurveyEmail`: 10 次/小时（链接调查邮件）
 
 **证据**:
 - `apps/web/modules/core/rate-limit/rate-limit-configs.ts` - 完整配置文件
@@ -646,7 +637,7 @@ export const rateLimitConfigs = {
 
 ---
 
-### 5.3 IP 级限流 (验证邮件/密码重置) ✅ 已实现
+### 5.3 IP 级限流 (验证邮件/密码重置) ✅ 邮件链路内调用
 
 **位置**: `apps/web/modules/core/rate-limit/helpers.ts:57-60`
 
@@ -670,7 +661,7 @@ await applyIPRateLimit(rateLimitConfigs.auth.verifyEmail);
 
 ---
 
-### 5.4 组织级限流 (Follow-up 邮件) ✅ 已实现
+### 5.4 组织级限流 (Follow-up 邮件) ✅ 邮件链路内调用
 
 **位置**: `apps/web/modules/core/rate-limit/helpers.ts:34-48`
 
@@ -784,24 +775,24 @@ sendFollowUpsForResponse(responseId)
 
 | 能力 | 状态 | 证据位置 |
 |-----|------|---------|
-| **SMTP Provider** | ✅ 已实现 | `apps/web/modules/email/index.tsx:71-107` |
-| **Resend Provider** | ❌ 未实现 | 全库无 Resend SDK/API 调用，邮件模块 0 匹配 |
-| **Provider 切换入口** | ❌ 未实现 | 无 EMAIL_PROVIDER 配置，无路由逻辑 |
-| **React Email 模板渲染** | ✅ 已实现 | `packages/email/src/lib/render.ts:1` |
-| **i18n 国际化注入** | ✅ 已实现 | 所有 `send*Email` 函数均调用 `getTranslate(locale)` |
-| **法律链接自动注入** | ✅ 已实现 | `apps/web/modules/email/index.tsx:56-61` |
-| **固定时间窗口限流** | ✅ 已实现 | `apps/web/modules/core/rate-limit/rate-limit.ts:36` |
-| **Redis Lua 原子操作** | ✅ 已实现 | `apps/web/modules/core/rate-limit/rate-limit.ts:46-61` |
-| **IP 级限流** | ✅ 已实现 | `rate-limit/helpers.ts:57-60` + 验证邮件调用 |
-| **组织级限流** | ✅ 已实现 | `rate-limit/helpers.ts:34-48` + follow-up 调用 |
-| **批量发送容错 (allSettled)** | ✅ 已实现 | `pipeline/route.ts:285` |
-| **单个发送 .catch() 日志** | ✅ 已实现 | `pipeline/route.ts:245-250` |
-| **Result 模式错误收集** | ✅ 已实现 | `follow-ups/lib/follow-ups.ts:133-139` |
-| **SMTP 配置缺失静默跳过** | ✅ 已实现 | `apps/web/modules/email/index.tsx:72-75` |
-| **自动失败重试** | ❌ 未实现 | 全库无重试函数，无重试库导入 |
-| **指数退避** | ❌ 未实现 | 无相关配置或代码 |
-| **死信队列/补偿机制** | ❌ 未实现 | 无邮件发送状态持久化表 |
-| **邮件发送状态持久化** | ❌ 未实现 | 无 email_logs 表定义 |
+| **SMTP Provider** | ✅ 邮件链路内已实现 | `apps/web/modules/email/index.tsx:71-107` |
+| **Resend Provider** | ❌ 邮件链路内未实现 | `apps/web/modules/email/` 目录 0 匹配 `resend` |
+| **Provider 切换入口** | ❌ 邮件链路内未实现 | 无 EMAIL_PROVIDER 配置，无路由逻辑 |
+| **React Email 模板渲染** | ✅ 邮件链路内已实现 | `packages/email/src/lib/render.ts:1` |
+| **i18n 国际化注入** | ✅ 邮件链路内已实现 | 所有 `send*Email` 函数均调用 `getTranslate(locale)` |
+| **法律链接自动注入** | ✅ 邮件链路内已实现 | `apps/web/modules/email/index.tsx:56-61` |
+| **固定时间窗口限流** | ✅ 邮件链路内已调用（通用模块实现） | `apps/web/modules/core/rate-limit/rate-limit.ts:36` + 邮件触发点调用 |
+| **Redis Lua 原子操作** | ✅ 邮件链路内已调用（通用模块实现） | `apps/web/modules/core/rate-limit/rate-limit.ts:46-61` |
+| **IP 级限流** | ✅ 邮件链路内已调用 | `rate-limit/helpers.ts:57-60` + 验证邮件调用 |
+| **组织级限流** | ✅ 邮件链路内已调用 | `rate-limit/helpers.ts:34-48` + follow-up 调用 |
+| **批量发送容错 (allSettled)** | ✅ 邮件链路内已实现 | `pipeline/route.ts:285` |
+| **单个发送 .catch() 日志** | ✅ 邮件链路内已实现 | `pipeline/route.ts:245-250` |
+| **Result 模式错误收集** | ✅ 邮件链路内已实现 | `follow-ups/lib/follow-ups.ts:133-139` |
+| **SMTP 配置缺失静默跳过** | ✅ 邮件链路内已实现 | `apps/web/modules/email/index.tsx:72-75` |
+| **自动失败重试** | ❌ 邮件链路内未实现 | `apps/web/modules/email/` 目录 0 匹配 `retry` |
+| **指数退避** | ❌ 邮件链路内未实现 | 无相关配置或代码 |
+| **死信队列/补偿机制** | ❌ 邮件链路内未实现 | 目录 0 匹配 `dlq`/`deadletter`/`compensat` |
+| **邮件发送状态持久化** | ❌ 邮件链路内未实现 | 无 email_logs 表定义 |
 
 ---
 
