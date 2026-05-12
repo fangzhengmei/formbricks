@@ -222,18 +222,19 @@ if (!survey.welcomeCard.enabled) {
 
 ```typescript
 // "看到或交互过"的判定标准（wasElementSeen 函数）
+// 注意：return 后表达式必须紧跟或用括号包裹，否则 ASI 会导致提前返回 undefined
 const wasElementSeen = (response, elementId) => {
-  return 
-    // OR 条件：满足任一即为"曝光"
-    (response.ttc != null && response.ttc[elementId] > 0)  // 条件1：在首题有停留时间（哪怕没答题就走了）
-    || response.data[elementId] !== undefined;            // 条件2：提交了首题答案
+  // OR 条件：满足任一即为"曝光/看到"
+  return (response.ttc != null && response.ttc[elementId] > 0)  // 条件1：在该题上有停留时间（哪怕没答题就走了）
+         || response.data[elementId] !== undefined;            // 条件2：提交了该题答案
 };
 ```
 
-这意味着：
-- ✅ 停留 3 秒但没答题就关闭 → **算曝光**（ttc > 0）
-- ✅ 完整填写首题答案 → **算曝光**（data 有值）
-- ❌ 页面加载后 0.1 秒闪退，ttc 没记录 → **不算曝光**
+**核心判定逻辑（OR 关系）**：
+- ✅ **条件1 满足**：停留 3 秒但没答题就关闭 → **算 seen**（ttc > 0）
+- ✅ **条件2 满足**：完整填写首题答案 → **算 seen**（data 有值）
+- ✅ **两条件都满足**：既有停留时间又有答案 → **算 seen**
+- ❌ **两条件都不满足**：页面加载后 0.1 秒闪退，ttc 没记录也没答案 → **不算 seen**
 
 ---
 
