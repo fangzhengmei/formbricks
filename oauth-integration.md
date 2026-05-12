@@ -657,27 +657,82 @@ export const getBases = async (accessToken: string) => {
 // apps/web/app/api/v1/integrations/airtable/tables/route.ts
 export const GET = withV1ApiWrapper({
   handler: async ({ req, authentication }) => {
-    const url = new URL(req.url);
-    const environmentId = url.searchParams.get("environmentId");
-    const baseId = url.searchParams.get("baseId");
+    // 1. 用户鉴权检查
+    if (!authentication || !("user" in authentication)) {
+      return { response: responses.notAuthenticatedResponse() };
+    }
 
-    // 确保使用有效的 Access Token（自动刷新）
+    // 2. environmentId 来自请求头，而非 query 参数
+    const url = req.url;
+    const environmentId = req.headers.get("environmentId");
+
+    // 3. baseId 使用 Zod 进行参数校验
+    const queryParams = new URLSearchParams(url.split("?")[1]);
+    const baseId = z.string().safeParse(queryParams.get("baseId"));
+
+    if (!baseId.success) {
+      return {
+        response: responses.badRequestResponse("Base Id is Required"),
+      };
+    }
+
+    if (!environmentId) {
+      return {
+        response: responses.badRequestResponse("environmentId is missing"),
+      };
+    }
+
+    // 4. 用户环境权限校验
+    const canUserAccessEnvironment = await hasUserEnvironmentAccess(
+      authentication.user.id,
+      environmentId
+    );
+    if (!canUserAccessEnvironment) {
+      return {
+        response: responses.unauthorizedResponse(),
+      };
+    }
+
+    // 5. 检查集成是否存在
+    const integration = await getIntegrationByType(environmentId, "airtable");
+    if (!integration) {
+      return {
+        response: responses.notFoundResponse("Integration not found", environmentId),
+      };
+    }
+
+    // 6. 使用 getAirtableToken 确保 token 已自动刷新
     const freshAccessToken = await getAirtableToken(environmentId);
     const tables = await getTables(
       { ...integration.config.key, access_token: freshAccessToken },
-      baseId
+      baseId.data
     );
 
     return { response: responses.successResponse(tables) };
   },
 });
 
-const tableFetcher = async (key, baseId) => {
+// apps/web/lib/airtable/service.ts - 完整调用链
+const tableFetcher = async (key: TIntegrationAirtableCredential, baseId: string) => {
   const req = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, {
     headers: { Authorization: `Bearer ${key.access_token}` },
   });
+
+  if (!req.ok) {
+    const body = await req.text().catch(() => "");
+    throw new Error(`Airtable API error fetching tables: ${req.status} ${req.statusText} ${body}`);
+  }
+
+  // 返回原始响应，不直接提取 tables 数组
   const res = await req.json();
-  return res.tables;
+  return res;
+};
+
+// getTables 通过 Zod schema 校验后返回包装结构
+export const getTables = async (key: TIntegrationAirtableCredential, baseId: string) => {
+  const res = await tableFetcher(key, baseId);
+  // ZIntegrationAirtableTables.parse 返回的是 { tables: [...] } 结构
+  return ZIntegrationAirtableTables.parse(res);
 };
 ```
 
