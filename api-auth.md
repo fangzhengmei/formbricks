@@ -361,9 +361,9 @@ export const rateLimitConfigs = {
 | `auth.signup` | `auth:signup` | `modules/auth/signup/actions.ts:234` |
 | `auth.forgotPassword` | `auth:forgot` | `modules/auth/forgot-password/actions.ts:21` |
 | `auth.verifyEmail` | `auth:verify` | `modules/auth/lib/authOptions.ts:381`, `modules/auth/verification-requested/actions.ts:55` |
-| `api.v1` | `api:v1` | `app/lib/api/with-api-logging.ts:74-79`, `app/api/v1/management/me/route.ts:158,175` |
+| `api.v1` | `api:v1` | `app/lib/api/with-api-logging.ts:76,79`, `app/api/v1/management/me/route.ts:104` |
 | `api.v2` | `api:v2` | `modules/api/v2/auth/api-wrapper.ts:125` |
-| `api.v3` | `api:v3` | `app/api/v3/lib/api-wrapper.ts:90-104` |
+| `api.v3` | `api:v3` | `app/api/v3/lib/api-wrapper.ts:384` |
 | `api.client` | `api:client` | `app/lib/api/with-api-logging.ts:61` |
 | `actions.emailUpdate` | `action:email` | `app/(app)/environments/[environmentId]/settings/(account)/profile/actions.ts:41` |
 | `actions.accountDeletion` | `action:account-delete` | `modules/account/components/DeleteAccountModal/actions.ts:36,56` |
