@@ -6,10 +6,10 @@
 
 ### 1.1 题型枚举定义
 
-**文件路径**：`packages/types/src/surveys/constants.ts`
+**文件路径**：`packages/types/surveys/constants.ts`
 
 ```typescript
-// packages/types/src/surveys/constants.ts:1-18
+// packages/types/surveys/constants.ts:1-18
 export enum TSurveyElementTypeEnum {
   FileUpload = "fileUpload",              // 文件上传
   OpenText = "openText",                  // 开放文本
