@@ -253,6 +253,7 @@ const luaScript = `
 | Client API (SDK 请求) | `withV1ApiWrapper` → `applyClientRateLimit` | `rateLimitConfigs.api.client` |
 | 用户注册 action | `signup/actions.ts:234` | `rateLimitConfigs.auth.signup` |
 | 忘记密码 action | `forgot-password/actions.ts:21` | `rateLimitConfigs.auth.forgotPassword` |
+| 发送问卷链接邮件 | `survey/link/actions.ts:17` | `rateLimitConfigs.actions.sendLinkSurveyEmail` |
 | 登录 (next-auth) | 需单独配置，暂无统一入口 | - |
 
 **实现函数**：
@@ -274,6 +275,10 @@ export const applyIPRateLimit = async (config) => {
 | V3 API (Session 模式) | `withV3ApiWrapper` → `getRateLimitIdentifier` line 90-104 | `rateLimitConfigs.api.v3` |
 | Storage DELETE (Session) | `storage/.../route.ts:109` | `rateLimitConfigs.storage.delete` |
 | V1 Me endpoint | `management/me/route.ts:175` | `rateLimitConfigs.api.v1` |
+| 账户删除（密码方式） | `DeleteAccountModal/actions.ts:56` | `rateLimitConfigs.actions.accountDeletion` |
+| 账户删除（SSO 重认证） | `DeleteAccountModal/actions.ts:36` | `rateLimitConfigs.actions.accountDeletion` |
+| 邮箱更新 | `profile/actions.ts:41` | `rateLimitConfigs.actions.emailUpdate` |
+| License 重新检查 | `license-check/actions.ts:45` | `rateLimitConfigs.actions.licenseRecheck` |
 
 **标识符解析**：
 ```typescript
@@ -311,15 +316,13 @@ if ("apiKeyId" in authentication) {
 }
 ```
 
-#### 🔹 限流入口四：Server Actions → 各 action 自行调用
+#### 🔹 限流入口四：Server Actions（组织级别限流）
 
-| 场景 | 调用位置 | 限流配置 |
-|------|---------|---------|
-| 邮箱更新 | 各 action 内部 (暂无) | `rateLimitConfigs.actions.emailUpdate` |
-| 账户删除 | `DeleteAccountModal/actions.ts` (待验证) | `rateLimitConfigs.actions.accountDeletion` |
-| 发送跟进邮件 | `follow-ups/lib/follow-ups.ts` (待验证) | `rateLimitConfigs.actions.surveyFollowUp` |
+| 场景 | 调用位置 | 限流配置 | 标识符 |
+|------|---------|---------|-------|
+| 问卷跟进邮件发送 | `follow-ups/lib/follow-ups.ts:196` | `rateLimitConfigs.actions.surveyFollowUp` | `organization.id` |
 
-### 3.3 限流配置矩阵（已实现）
+### 3.3 限流配置矩阵（已实现，真实值）
 
 ```typescript
 // apps/web/modules/core/rate-limit/rate-limit-configs.ts
@@ -337,19 +340,40 @@ export const rateLimitConfigs = {
     client: { interval: 60, allowedPerInterval: 100, namespace: "api:client" },
   },
   actions: {
-    emailUpdate:       { interval: 3600, allowedPerInterval: 3, namespace: "action:emailUpdate" },
-    accountDeletion:   { interval: 3600, allowedPerInterval: 5, namespace: "action:accountDeletion" },
-    licenseRecheck:    { interval: 60,   allowedPerInterval: 5, namespace: "action:licenseRecheck" },
-    surveyFollowUp:    { interval: 3600, allowedPerInterval: 50, namespace: "action:surveyFollowUp" },
+    emailUpdate:          { interval: 3600, allowedPerInterval: 3,  namespace: "action:email" },             // 每小时3次
+    accountDeletion:      { interval: 3600, allowedPerInterval: 5,  namespace: "action:account-delete" },    // 每小时5次
+    surveyFollowUp:       { interval: 3600, allowedPerInterval: 50, namespace: "action:followup" },          // 每小时50次
+    sendLinkSurveyEmail:  { interval: 3600, allowedPerInterval: 10, namespace: "action:send-link-survey-email" }, // 每小时10次
+    licenseRecheck:       { interval: 60,   allowedPerInterval: 5,  namespace: "action:license-recheck" },   // 每分钟5次
   },
   storage: {
-    upload: { interval: 60, allowedPerInterval: 5, namespace: "storage:upload" },
-    delete: { interval: 60, allowedPerInterval: 5, namespace: "storage:delete" },
+    upload: { interval: 60, allowedPerInterval: 5, namespace: "storage:upload" }, // 每分钟5次
+    delete: { interval: 60, allowedPerInterval: 5, namespace: "storage:delete" }, // 每分钟5次
   },
-};
+} as const;
 ```
 
-### 3.4 Personal Token 限流：设计方案
+### 3.4 配置键 - Namespace - 调用位置对照表
+
+| 配置键 | Namespace（真实值） | 调用位置 |
+|-------|---------------------|---------|
+| `auth.login` | `auth:login` | next-auth 配置 |
+| `auth.signup` | `auth:signup` | `auth/signup/actions.ts:234` |
+| `auth.forgotPassword` | `auth:forgot` | `auth/forgot-password/actions.ts:21` |
+| `auth.verifyEmail` | `auth:verify` | 邮件验证流程 |
+| `api.v1` | `api:v1` | `with-api-logging.ts:74-79`, `management/me/route.ts:158,175` |
+| `api.v2` | `api:v2` | `api/v2/auth/api-wrapper.ts:125` |
+| `api.v3` | `api:v3` | `api/v3/lib/api-wrapper.ts:90-104` |
+| `api.client` | `api:client` | `with-api-logging.ts:87` |
+| `actions.emailUpdate` | `action:email` | `profile/actions.ts:41` |
+| `actions.accountDeletion` | `action:account-delete` | `DeleteAccountModal/actions.ts:36,56` |
+| `actions.surveyFollowUp` | `action:followup` | `follow-ups/lib/follow-ups.ts:196` |
+| `actions.sendLinkSurveyEmail` | `action:send-link-survey-email` | `survey/link/actions.ts:17` |
+| `actions.licenseRecheck` | `action:license-recheck` | `license-check/actions.ts:45` |
+| `storage.upload` | `storage:upload` | Storage Upload API |
+| `storage.delete` | `storage:delete` | `storage/.../route.ts:107,109` |
+
+### 3.5 Personal Token 限流：设计方案
 
 **方案 A：Token 独立配额（推荐）**
 ```typescript
