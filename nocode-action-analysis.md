@@ -196,141 +196,197 @@ if (!result.ok) {
 
 ---
 
-## 五、监听器生命周期与清理一致性分析
+## 五、监听器生命周期与清理一致性分析（真实可达行为）
 
-### 5.1 注册与解绑对称性核对
+### 5.1 真实调用链还原
 
-| 监听器类型 | 注册函数 | 解绑函数 | 对称状态 | 备注 |
-|-----------|---------|---------|---------|------|
-| **Page URL 事件** | `addPageUrlEventListeners` | `removePageUrlEventListeners` | ✅ 基本对称 | 但 History 补丁无法恢复 |
-| **Click 事件** | `addClickEventListener` | `removeClickEventListener` | ✅ 对称 | 目标: `document` |
-| **Exit Intent 事件** | `addExitIntentListener` | `removeExitIntentListener` | ⚠️ 不对称 | 注册目标: `document.body`, 解绑目标: `document` |
-| **Scroll Depth 事件** | `addScrollDepthListener` | `removeScrollDepthListener` | ⚠️ 潜在不对称 | `load` 事件触发后才真正注册 |
-| **PageDwell 定时器** | (内部创建) | `clearTimeOnPageTimers` | ✅ 对称 | 独立函数清理 |
-| **beforeunload 清理** | `addCleanupEventListeners` | `removeCleanupEventListeners` | ❌ **严重 Bug** | 函数引用不匹配 |
-
-### 5.2 History API 补丁的永久影响
-
-**问题描述**:
-- `addPageUrlEventListeners` 对 `history.pushState` 和 `history.replaceState` 进行 monkey patch
-- **补丁一旦应用就永远无法恢复**，因为原始函数引用只存在于函数闭包中
-- 没有提供任何恢复原始 history 方法的 API
-
-**代码位置** (`packages/js-core/src/lib/survey/no-code-action.ts:167-188`):
-```typescript
-if (!isHistoryPatched) {
-  const originalPushState = history.pushState;
-  history.pushState = function (...args) {
-    originalPushState.apply(this, args);
-    const event = new Event("pushstate");
-    window.dispatchEvent(event);
-  };
-  // ... replaceState 同样的处理
-  isHistoryPatched = true;
-}
+```
+生产环境可达路径:
+┌─────────────────────────────────────────────────────────────┐
+│  setup()                                                    │
+│    ├─ 首次调用: addEventListeners()  ← 添加所有监听器      │
+│    └─ 首次调用: addCleanupEventListeners()  ← 添加 beforeunload │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  tearDown()  ← 只在 setUserId(不同用户) / logout 时调用     │
+│    ├─ 重置用户状态为 DEFAULT_USER_STATE_NO_USER_ID          │
+│    ├─ 更新 filteredSurveys                                   │
+│    └─ closeSurvey()                                          │
+│    ❗ 注意: 完全不调用任何 remove* 清理函数                  │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  removeAllEventListeners()                                   │
+│    └─ 仅在测试代码中被调用，生产代码从未调用 ❗              │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  beforeunload 事件                                           │
+│    └─ 触发清理逻辑，但监听器本身永远无法被移除（见 5.3）     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**潜在影响**:
-1. **内存泄漏**: 闭包持有原始函数引用，无法被 GC
-2. **行为污染**: 即使 SDK 被"卸载"，history 方法仍然会派发额外事件
-3. **兼容性风险**: 可能与其他也 patch history 的库冲突
-4. **多次 patch 风险**: 如果 `isHistoryPatched` 标志被意外重置，可能导致嵌套 patch
+### 5.2 注册与解绑对称性核对（修正版）
 
-### 5.3 Exit Intent 监听器目标不一致
+| 监听器类型 | 注册时机 | 生产环境是否会被解绑 | 对称状态 | 备注 |
+|-----------|---------|---------------------|---------|------|
+| **Page URL 事件** | setup | ❌ **永不** | ⚠️ 不对称 | History 补丁永久生效，无恢复机制 |
+| **Click 事件** | setup | ❌ **永不** | ⚠️ 不对称 | 清理函数存在但从未被生产代码调用 |
+| **Exit Intent 事件** | setup | ❌ **永不** | ❌ 严重不对称 | 注册目标: body，解绑目标: document，且解绑永不被调用 |
+| **Scroll Depth 事件** | setup | ❌ **永不** | ⚠️ 不对称 | 存在时序问题，但实际永远不会触发解绑 |
+| **PageDwell 定时器** | 页面 URL 变化时 | ✅ 页面切换时清理 | ✅ 相对对称 | 仅此类型有运行时清理 |
+| **beforeunload 清理** | setup | ❌ **永不** | ❌ 严重 Bug | 匿名函数引用不匹配，永远无法移除 |
 
-**问题代码**:
+### 5.3 核心问题的真实影响范围
+
+---
+
+#### 🔴 问题 1: beforeunload 匿名函数不匹配（严重 Bug）
+
+**代码位置**: `packages/js-core/src/lib/common/event-listeners.ts:29-55`
+
+**问题本质**:
 ```typescript
-// 注册: no-code-action.ts:278-280
+window.addEventListener("beforeunload", () => { /* 匿名函数 A */ });
+window.removeEventListener("beforeunload", () => { /* 匿名函数 B */ });
+// ❌ () => {} !== () => {}，永远静默失败
+```
+
+**真实影响范围**:
+- ✅ **不影响正常触发逻辑**：beforeunload 只在页面卸载时执行，不影响运行时的 action 触发
+- ⚠️ **仅影响测试场景**：只有测试中才会调用 `removeCleanupEventListeners`
+- ⚠️ **内存泄漏**：监听器永久残留，但页面卸载时内存会被回收，实际影响有限
+- ❌ **不会导致重复触发**：beforeunload 只触发一次
+
+**结论**: 这是一个代码质量问题，但**不影响用户可见的触发行为**，主要影响测试可靠性。
+
+---
+
+#### 🔴 问题 2: Exit Intent 注册/解绑目标不一致 + body 不存在时的标志位错误
+
+**代码位置**: `packages/js-core/src/lib/survey/no-code-action.ts:276-290`
+
+**问题本质 1**:
+```typescript
 document.querySelector("body")?.addEventListener("mouseleave", checkExitIntentWrapper);
+// 注册在 body 上
 
-// 解绑: no-code-action.ts:286-288
 document.removeEventListener("mouseleave", checkExitIntentWrapper);
+// 解绑在 document 上
+// ❌ 目标不同，永远无法移除
 ```
 
-**问题描述**:
-- 注册时目标是 **`document.body`**
-- 解绑时目标是 **`document`**
-- 根据 DOM 事件规范，事件目标不同时，`removeEventListener` 会静默失败
-
-**实际影响**:
-- ❌ Exit Intent 监听器**永远无法被正确移除**
-- ❌ 即使调用 `removeExitIntentListener`，监听器仍然存在
-- ❌ 页面跳转后可能残留，导致重复触发或内存泄漏
-
-### 5.4 beforeunload 清理监听器的严重 Bug
-
-**问题代码** (`packages/js-core/src/lib/common/event-listeners.ts:29-55`):
+**问题本质 2（body 不存在时）**:
 ```typescript
-export const addCleanupEventListeners = (): void => {
-  if (areRemoveEventListenersAdded) return;
-  window.addEventListener("beforeunload", () => {  // 匿名函数 A
-    // ... 清理逻辑
-  });
-  areRemoveEventListenersAdded = true;
-};
-
-export const removeCleanupEventListeners = (): void => {
-  if (!areRemoveEventListenersAdded) return;
-  window.removeEventListener("beforeunload", () => {  // 匿名函数 B - 不相等!
-    // ... 相同的清理逻辑
-  });
-  areRemoveEventListenersAdded = false;
-};
-```
-
-**Bug 核心原因**:
-- `addEventListener` 和 `removeEventListener` 使用了**两个不同的匿名函数实例**
-- 在 JavaScript 中，`() => {} !== () => {}`，即使函数体完全相同
-- 因此 `removeEventListener` **静默失败**，监听器永远不会被移除
-
-**实际影响**:
-1. beforeunload 监听器永久残留
-2. 页面刷新/关闭时清理逻辑可能被多次执行
-3. 内存泄漏（闭包持有整个 SDK 状态引用）
-4. 标志位 `areRemoveEventListenersAdded` 与实际状态不一致
-
-### 5.5 Scroll Depth 监听器的时序问题
-
-**问题场景**:
-```typescript
-export const addScrollDepthListener = (): void => {
-  if (document.readyState === "complete") {
-    window.addEventListener("scroll", checkScrollDepthWrapper);
-  } else {
-    window.addEventListener("load", () => {
-      window.addEventListener("scroll", checkScrollDepthWrapper);
-    });
+export const addExitIntentListener = (): void => {
+  if (typeof document !== "undefined" && !isExitIntentListenerAdded) {
+    document.querySelector("body")?.addEventListener(...);
+    // 👆 如果 body 不存在，可选链短路，不添加监听器
+    isExitIntentListenerAdded = true;
+    // 👆 但标志位仍被设为 true！
   }
-  scrollDepthListenerAdded = true;
 };
 ```
 
-**潜在问题**:
-1. 如果在 `load` 事件触发前调用 `removeScrollDepthListener`:
-   - 标志位设为 `false`
-   - 但 `load` 事件仍会在未来触发，最终还是会添加 scroll 监听器
-   - 导致"已移除"但实际仍在监听的不一致状态
+**真实影响范围**:
+- ✅ **正常浏览器环境**：body 存在时，监听器确实被添加到 body 上
+- ❌ **但永远无法被移除**：即使调用解绑函数（实际不会被调用）也没用
+- ❌ **SSR/iframe 沙箱/文档解析早期**：body 不存在时
+  - 监听器**不被添加**
+  - 但 `isExitIntentListenerAdded = true`
+  - **后续即使 body 出现了，也永远无法再注册监听器**
+- ⚠️ **对触发判断的影响**：Exit Intent action 可能在某些环境下完全无法触发
 
-2. 没有取消 `load` 事件监听器的机制
+---
 
-### 5.6 监听器残留对触发判断的影响
+#### 🟠 问题 3: History API 补丁永久污染
 
-| 残留监听器 | 对触发判断的影响 | 严重程度 |
-|-----------|----------------|---------|
-| **History 补丁残留** | pushState/replaceState 仍会派发自定义事件 → pageView 逻辑可能被意外触发 | 🔴 高 |
-| **Exit Intent 残留** | mouseleave 仍会检测 → 页面卸载后仍可能触发 exitIntent action | 🟠 中 |
-| **beforeunload 清理残留** | 页面卸载时清理逻辑重复执行 → 可能导致状态异常 | 🟡 低 |
-| **Scroll Depth 时序残留** | scroll 事件仍会检测滚动深度 → 页面切换后仍可能触发 | 🟠 中 |
-| **Click 监听器残留** | 点击仍会匹配元素 → 非预期页面也可能触发 click action | 🟠 中 |
+**代码位置**: `packages/js-core/src/lib/survey/no-code-action.ts:167-188`
 
-### 5.7 页面生命周期中的清理时机
+**问题本质**:
+- 原始 `pushState`/`replaceState` 引用只存在于闭包中
+- 没有任何 API 可以恢复原始方法
+- `isHistoryPatched` 是模块级变量，一旦设为 true 就永远不会重置
 
-| 清理时机 | 实际行为 | 问题 |
-|---------|---------|------|
-| **beforeunload 事件** | 调用所有移除函数 + clearTimeOnPageTimers | ✅ 意图正确，但实现有 Bug |
-| **手动调用 removeAllEventListeners** | 调用所有移除函数 | ❌ History 补丁不会恢复 |
-| **SPA 页面切换** | 无自动清理 | ❌ 监听器全部残留 |
-| **热更新/HMR** | 无特殊处理 | ❌ 可能导致重复注册 |
+**真实影响范围**:
+- ✅ **直接影响 pageView 触发**：任何 pushState/replaceState 调用都会派发自定义事件
+- ❌ **SPA 路由切换时重复触发风险**：即使 SDK 逻辑上"重置"了，patch 仍在
+- ❌ **与其他库冲突风险**：如果有多个库 patch history，可能导致嵌套调用
+- ⚠️ **仅重初始化/测试场景有影响**：正常单页应用中，SDK 只 setup 一次
+
+---
+
+#### 🟡 问题 4: Scroll Depth 时序问题
+
+**问题本质**:
+```typescript
+if (document.readyState === "complete") {
+  window.addEventListener("scroll", checkScrollDepthWrapper);
+} else {
+  window.addEventListener("load", () => {
+    window.addEventListener("scroll", checkScrollDepthWrapper);
+  });
+}
+scrollDepthListenerAdded = true;  // 立即设为 true，不管 scroll 监听器是否真的添加了
+```
+
+**真实影响范围**:
+- ⚠️ **仅极端时序场景有影响**：在 `load` 事件触发前调用 remove（但生产中 remove 永不被调用）
+- ✅ **正常生产流程无影响**：setup 通常在页面加载完成后执行，即使没完成，load 事件最终也会添加监听器
+
+---
+
+#### 🔴 问题 5: tearDown 完全不清理监听器（最大隐藏问题）
+
+**代码位置**: `packages/js-core/src/lib/common/setup.ts:328-345`
+
+**问题本质**:
+```typescript
+export const tearDown = (): void => {
+  // ... 只重置用户状态和关闭调查
+  closeSurvey();
+  // ❗ 没有调用任何 remove*EventListeners 函数
+  // ❗ 没有清理定时器
+  // ❗ 没有重置任何标志位
+};
+```
+
+**真实影响范围**:
+- ❌ **切换用户后所有监听器仍在运行**：包括点击检测、退出意图检测、滚动检测
+- ❌ **旧用户的 actionClasses 配置可能仍在生效**（取决于 Config 是否更新）
+- ✅ **不影响新用户的触发逻辑**：新的 actionClasses 会覆盖旧的配置
+- ⚠️ **仅多用户切换场景有影响**：单用户场景下永远不会遇到
+
+---
+
+### 5.4 测试盲区分析
+
+| 测试文件 | 盲区位置 | 问题描述 | 实际后果 |
+|---------|---------|---------|---------|
+| `event-listeners.test.ts:99-104` | `removeCleanupEventListeners` 测试 | 用 `expect.any(Function)` 断言，这**永远通过** | 完全没检测到匿名函数不匹配的严重 Bug |
+| `no-code-action.test.ts:276-286` | Exit Intent 解绑测试 | 分别 mock document 和 document.body，不验证目标一致性 | 测试通过，但实际代码永远无法解绑 |
+| 所有测试 | | 没有测试"body 不存在"的边界场景 | 标志位错误无法被发现 |
+| 所有测试 | | 没有测试"重复 setup/tearDown"场景 | 监听器残留问题无法被发现 |
+| 所有测试 | | 只验证"函数被调用了"，不验证"监听器真的被移除了" | 所有解绑测试都是"假阳性" |
+
+### 5.5 对触发判断的真实影响总结
+
+| 问题 | 影响运行时触发吗？ | 仅测试场景？ | 严重程度 |
+|-----|-------------------|------------|---------|
+| beforeunload 匿名函数不匹配 | ❌ 不影响 | ✅ 仅测试 | 🟡 低 |
+| Exit Intent 注册/解绑目标不一致 | ✅ 影响（SSR 环境） | ❌ | 🔴 高 |
+| Exit Intent body 不存在时标志位错误 | ✅ 影响（SSR 环境） | ❌ | 🔴 高 |
+| History 补丁永久污染 | ✅ 影响（重初始化场景） | ⚠️ 部分 | 🟠 中 |
+| Scroll Depth 时序问题 | ❌ 几乎不影响 | ✅ 仅测试 | 🟡 低 |
+| tearDown 不清理监听器 | ✅ 影响（多用户切换） | ❌ | 🟠 中 |
+
+### 5.6 关键发现总结
+
+1. **90% 的清理代码在生产环境中是死代码**：所有 `remove*` 函数除了在 beforeunload 中外，从未被实际调用
+2. **最大的问题不是无法移除，而是移除函数本身就不会被调用**
+3. **Exit Intent 有两个独立 Bug**：目标不一致 + body 不存在时标志位错误
+4. **测试存在系统性盲区**：所有解绑测试都是"假阳性"，只验证函数被调用，不验证实际效果
 
 ---
 
@@ -338,7 +394,8 @@ export const addScrollDepthListener = (): void => {
 
 | 功能模块 | 文件路径 | 核心函数 |
 |---------|---------|---------|
-| NoCode 事件监听 | `packages/js-core/src/lib/survey/no-code-action.ts` | `addPageUrlEventListeners`, `addClickEventListener`, `addExitIntentListener`, `addScrollDepthListener` |
+| NoCode 事件监听 | `packages/js-core/src/lib/survey/no-code-action.ts` | `addPageUrlEventListeners`, `addClickEventListener`, `addExitIntentListener`, `addScrollDepthListener`, `clearTimeOnPageTimers` |
+| 事件清理管理 | `packages/js-core/src/lib/common/event-listeners.ts` | `addEventListeners`, `addCleanupEventListeners`, `removeCleanupEventListeners`, `removeAllEventListeners` |
 | 匹配核心逻辑 | `packages/js-core/src/lib/common/utils.ts` | `handleUrlFilters`, `checkUrlMatch`, `evaluateNoCodeConfigClick` |
 | Action 触发 | `packages/js-core/src/lib/survey/action.ts` | `trackNoCodeAction`, `trackAction` |
 | 类型定义 | `packages/types/action-classes.ts` | `ZActionClassNoCodeConfig`, `TActionClassPageUrlRule` |
@@ -347,7 +404,7 @@ export const addScrollDepthListener = (): void => {
 
 ---
 
-## 六、设计特点总结
+## 七、设计特点总结
 
 ### 优点
 1. **模块化设计**: 每种事件类型独立管理，职责清晰
@@ -355,8 +412,16 @@ export const addScrollDepthListener = (): void => {
 3. **事件委托**: Click 事件支持祖先元素匹配，适配动态 DOM
 4. **URL 功能丰富**: 7 种匹配规则 + AND/OR 连接器，满足复杂场景
 
-### 潜在优化点
+### 已发现的严重问题
+1. **🔴 beforeunload 清理监听器 Bug**: 匿名函数引用不匹配，导致永远无法移除
+2. **🔴 Exit Intent 监听器目标不一致**: 注册在 body，解绑在 document，永远无法移除
+3. **🟠 History 补丁不可恢复**: monkey patch 后无还原机制，永久污染全局
+4. **🟠 Scroll Depth 时序问题**: load 事件触发前解绑会导致"假移除"状态
+
+### 其他潜在优化点
 1. **缺少匹配优先级**: 无法配置 action 优先级，完全依赖数组顺序
 2. **缺少匹配统计**: 无法知道某个 action 匹配了多少次
 3. **缺少调试钩子**: 匹配失败无日志，调试困难
 4. **正则无超时**: 恶意正则可能导致性能问题（虽然概率低）
+5. **缺少 SPA 路由切换清理**: 单页应用页面切换时无自动清理机制
+6. **缺少监听器幂等性保证**: 重复注册/移除缺乏健壮的状态校验
