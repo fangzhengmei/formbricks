@@ -406,7 +406,91 @@ export const tearDown = (): void => {
 
 ## 七、tearDown 跨用户触发风险专项分析
 
-### 7.1 tearDown 实际执行内容（与预期对比）
+### 7.1 CommandQueue 关键特性证据（直接来自源码）
+
+#### 特性 1：完全没有去重机制（FIFO 严格顺序）
+```typescript
+// command-queue.ts:37-66
+public add(
+  command: TCommand,
+  type: CommandType,
+  shouldCheckSetupFlag = true,
+  ...args: any[]
+): Promise<Result<void, unknown>> {
+  return new Promise((addResolve) => {
+    try {
+      const newItem: InternalQueueItem = {
+        command,
+        type,
+        checkSetup: shouldCheckSetupFlag,
+        commandArgs: args,  // actionName 只是参数，不是去重键！
+      };
+
+      this.queue.push(newItem);  // 🔴 直接 push，无任何去重检查！
+
+      if (!this.running) {
+        this.commandPromise = new Promise((resolve) => {
+          this.resolvePromise = resolve;
+          void this.run();
+        });
+      }
+      // ...
+    }
+  });
+}
+```
+
+**结论**: CommandQueue 没有去重键、没有合并逻辑、没有丢弃策略。同名 action 每次 `add` 都会独立入队，按 FIFO 顺序全部执行。
+
+---
+
+#### 特性 2：GeneralAction 会等待用户更新完成（关键保护机制！）
+```typescript
+// command-queue.ts:90-97
+if (currentItem.type === CommandType.GeneralAction) {
+  // first check if there are pending updates in the update queue
+  const updateQueue = UpdateQueue.getInstance();
+  if (!updateQueue.isEmpty()) {
+    console.log("🧱 Formbricks - Waiting for pending updates to complete before executing command");
+    await updateQueue.processUpdates();  // 🔴 等待所有用户更新完成！
+  }
+}
+```
+
+**结论**: pageDwell 使用 `CommandType.GeneralAction`，会自动等待 UpdateQueue 完成。这意味着 tearDown 后触发的 action **必然使用新用户的完整配置**，不会出现"半旧半新"的不一致状态。
+
+---
+
+#### 特性 3：checkSetup 在**执行时**才检查（不是入队时）
+```typescript
+// command-queue.ts:82-88
+if (currentItem.checkSetup) {
+  const setupResult = checkSetup();
+  if (!setupResult.ok) {
+    console.warn(`🧱 Formbricks - Setup not complete.`);
+    continue;  // 🔴 setup 不完整才跳过，否则正常执行
+  }
+}
+```
+
+**结论**: tearDown 不会改变 isSetup 标志（仍为 true），所以所有入队的 action 都会正常执行，不会被跳过。
+
+---
+
+#### pageDwell 的具体调用签名
+```typescript
+// no-code-action.ts:98
+void queue.add(
+  trackNoCodeTimeOnPageActionHandler,  // 命令函数
+  CommandType.GeneralAction,           // 类型 → 触发 UpdateQueue 等待
+  true,                                 // shouldCheckSetupFlag → 执行时检查 setup
+  actionName                            // commandArgs[0] → 只是参数，不是去重键
+);
+```
+
+---
+
+### 7.2 tearDown 实际执行内容（与预期对比）
 
 | 预期应该做的 | 实际做了什么 | 缺失的影响 |
 |------------|------------|----------|
@@ -419,7 +503,9 @@ export const tearDown = (): void => {
 | 重新计算 filteredSurveys | ✅ 做了 | 用 DEFAULT_USER_STATE_NO_USER_ID 过滤 |
 | 关闭当前显示的调查 | ✅ 做了 | 调用 closeSurvey() |
 
-### 7.2 跨用户触发时序推演（pageDwell 场景）
+---
+
+### 7.3 跨用户触发时序推演（pageDwell 场景 + CommandQueue 细节）
 
 #### 场景设定
 - 用户A 登录，在页面 `/dashboard` 停留
@@ -427,13 +513,15 @@ export const tearDown = (): void => {
 - 用户A 有权看到 SurveyA（仅登录用户可见）
 - 匿名用户（默认）无权看到 SurveyA
 
-#### 精确时序
+#### 精确时序（修订版）
 ```
 T0: 用户A 进入 /dashboard
     ↓
-    checkPageUrl() 被调用
+    checkPageUrl() → checkTimeOnPage() 被调用
     ↓
-    pageDwell 定时器启动（id = 123, actionName = "timeOnPage_30s"）
+    timeOnPageTimers 层面去重：同一个 pageKey + actionName 不会重复启动
+    ↓
+    定时器 T1 启动（id = 123, actionName = "timeOnPage_30s"）
     ↓
     timeOnPageTimers.set("timeOnPage_30s", {
       status: "running",
@@ -449,45 +537,69 @@ T0+10s: 调用 setUserId("用户B") / logout()
     ✅ Config.filteredSurveys = filterSurveys(env, anonymousUser) → SurveyA 不在列表中
     ✅ closeSurvey() 被调用
     ↓
-    ❗ 注意：timeOnPageTimers 中的定时器 123 完全没有被触碰！
-    ❗ 注意：isSetup 标志仍然为 true！
-    ❗ 注意：CommandQueue 完全没有被清理！
+    ❗ timeOnPageTimers 中的定时器 T1 完全没有被触碰！
+    ❗ CommandQueue 完全没有被清理！
+    ❗ isSetup 标志仍然为 true！
 
-T0+29s: CommandQueue 中有用户A 之前触发的其他 action（如果有的话）
+T0+15s: 用户B 在同一页面停留
     ↓
-    这些命令会正常执行，使用当前的（匿名用户）配置
+    假设触发 pageView，再次调用 checkTimeOnPage()
+    ↓
+    const existing = timeOnPageTimers.get("timeOnPage_30s")
+    if (existing?.pageKey === currentPageKey) continue  // ✅ 跳过，不会重复启动 T2
+    ↓
+    🔴 重要：timeOnPageTimers 层面有去重，但这是"启动定时器"的去重，不是 CommandQueue 层面的去重
 
-T0+30s: 定时器 123 到期触发
+T0+30s: 定时器 T1 到期触发
     ↓
     timeOnPageTimers.set("timeOnPage_30s", { status: "fired", pageKey: "/dashboard" })
     ↓
     queue.add(trackNoCodeTimeOnPageActionHandler, CommandType.GeneralAction, true, "timeOnPage_30s")
+    ↓
+    新元素入队到队尾
 
 T0+30s + 几毫秒: CommandQueue 执行该命令
     ↓
-    checkSetup() → 返回 ok ✅（isSetup 仍为 true）
+    1. checkSetup() → 仍然为 true ✅
+    2. 检查 UpdateQueue：
+       - 如果 setUserId 触发的用户更新还没完成 → 🔴 自动等待 processUpdates() 完成
+       - 如果已完成 → 直接执行
+    3. trackNoCodeTimeOnPageActionHandler("timeOnPage_30s")
+    4. → trackAction("timeOnPage_30s")
+    5. → 🔴 使用 tearDown 后的新用户 filteredSurveys（已等待更新完成，必然是新用户）
     ↓
-    检查 UpdateQueue 为空，无需等待
-    ↓
-    trackAction("timeOnPage_30s") 被调用
-    ↓
-    appConfig.get().filteredSurveys → 使用当前的匿名用户配置
-    ↓
-    遍历 filteredSurveys，寻找 trigger.actionClass.name === "timeOnPage_30s"
-    ↓
-    最终结果取决于匿名用户是否有匹配的 survey trigger
+    最终结果：
+    - 如果匿名用户有 "timeOnPage_30s" trigger → ✅ 正常触发匿名用户的 survey
+    - 如果只有登录用户有 → ❌ 不会触发，filteredSurveys 已过滤
 ```
 
-### 7.3 真实影响边界分析
+---
+
+### 7.4 同名 action 的命运矩阵（setUserId/logout 前后）
+
+| 场景 | 是否合并 | 是否丢弃 | 是否继续执行 | 备注 |
+|-----|---------|---------|-------------|------|
+| **定时器已启动，用户切换后才触发** | ❌ 不合并 | ❌ 不丢弃 | ✅ 继续执行 | 使用新用户配置，且 GeneralAction 等待更新完成 |
+| **用户切换前已入队但未执行的 action** | ❌ 不合并 | ❌ 不丢弃 | ✅ 继续执行 | 出队时使用当前（新）用户配置 |
+| **用户切换后新触发的同名 action** | ❌ 不合并 | ❌ 不丢弃 | ✅ 独立入队执行 | CommandQueue 无去重，两个都会执行 |
+| **同一个 actionName 在同一页面重复启动定时器** | ✅ 启动前去重 | — | — | timeOnPageTimers 层面阻止，不会重复启动 |
+
+**关键结论**: 没有任何合并/丢弃机制。所有 action 全部执行，只是执行时的配置可能已经变化。
+
+---
+
+### 7.5 真实影响边界分析（收敛版）
 
 | 情况 | 是否会触发 | 归属用户 | 备注 |
 |-----|-----------|---------|------|
-| **匿名用户也有相同的 pageDwell action trigger** | ✅ 会触发 | 匿名用户 | ✅ 逻辑上"正确"，但时序来源是旧用户 |
-| **只有登录用户有该 action trigger** | ❌ 不会触发 | 无 | ✅ 安全，因为 filteredSurveys 已更新为匿名用户 |
-| **触发时还在排队等待 UpdateQueue** | ✅ 会等待新用户的更新完成 | 新用户 | ⚠️ 如果 setUserId 有后端请求，可能导致混淆 |
+| **匿名用户也有相同的 pageDwell action trigger** | ✅ 会触发 | 匿名用户 | ✅ 逻辑正确，且 GeneralAction 确保配置已更新 |
+| **只有登录用户有该 action trigger** | ❌ 不会触发 | 无 | ✅ 100% 安全，filteredSurveys 已更新为匿名用户 |
+| **触发时 UpdateQueue 还有用户更新** | ✅ 会等待完成 | 新用户 | ✅ GeneralAction 保护机制，必然用新用户配置 |
 | **页面 URL 在定时器触发前改变了** | ❌ 不会触发 | 无 | ✅ checkTimeOnPage() 会因 URL 不匹配清理该定时器 |
 
-### 7.4 可复现条件（三个条件必须同时满足）
+---
+
+### 7.6 可复现条件（修订版：4 个必须同时满足）
 
 1. **✅ 定时器启动后，页面 URL 没有发生变化**
    - 如果 URL 变化，checkTimeOnPage 会自动清理不匹配的定时器
@@ -499,20 +611,26 @@ T0+30s + 几毫秒: CommandQueue 执行该命令
 
 3. **✅ 匿名用户/新用户的 filteredSurveys 包含该 pageDwell action trigger**
    - 最常见情况：所有用户（包括匿名）都有相同的 pageDwell action
+   - 如果只有旧用户有，100% 不会触发
 
-### 7.5 不会造成跨用户行为归属的根本原因
+4. **✅ timeOnPageTimers 在 tearDown 时没有被清理**
+   - 当前代码确实没有清理
+   - 这是唯一的代码缺陷，一行即可修复
 
-**核心关键: trackAction 不携带用户身份上下文，只使用 Config 中的当前用户状态**
+---
 
+### 7.7 不会造成跨用户行为归属的根本原因（强化版）
+
+**核心关键 1: trackAction 永远使用当前 Config，不带历史上下文**
 ```typescript
 export const trackAction = async (name: string): Promise<Result<void, NetworkError>> => {
-  // 🔴 关键点：这里永远使用"当前"的 Config，不是启动定时器时的 Config
-  const activeSurveys = appConfig.get().filteredSurveys;  // 快照当前用户配置
+  // 🔴 执行时快照，不是入队时/启动定时器时
+  const activeSurveys = appConfig.get().filteredSurveys;
   
   for (const survey of activeSurveys) {
     for (const trigger of survey.triggers) {
       if (trigger.actionClass.name === name) {
-        // 🔴 触发的是当前用户（匿名/新用户）的 survey，不是旧用户的
+        // 🔴 触发的是当前用户（匿名/新用户）的 survey，永远不会是旧用户的
         await triggerSurvey(survey, name, properties);
       }
     }
@@ -520,52 +638,52 @@ export const trackAction = async (name: string): Promise<Result<void, NetworkErr
 };
 ```
 
-**结论**: 不会把旧用户的行为"归属"到新用户，因为：
-- 新用户/匿名用户的 filteredSurveys 已经过滤掉了仅旧用户可见的 survey
-- triggerSurvey 使用当前用户上下文创建响应
+**核心关键 2: GeneralAction + UpdateQueue 双重保护**
+- setUserId/logout 会把用户更新加入 UpdateQueue
+- CommandQueue 执行 GeneralAction 时会自动 `await updateQueue.processUpdates()`
+- 这意味着 tearDown 后触发的 pageDwell action **必然等待新用户配置完全更新后才执行**
 
-**但仍然有问题**: 这个 action 的触发时机来源是旧用户的行为，却在新用户身份下执行，可能造成数据分析时的时序混淆。
+**最终结论（风险大幅下调）**:
+- ❌ **绝对不会**把旧用户的行为归属到新用户
+- ❌ **绝对不会**出现新旧配置混用的不一致状态
+- ⚠️ 只有一个小问题：这个 action 的触发时机"来源"是旧用户启动的定时器，但执行时已是新用户身份，可能造成数据分析时的时序混淆（但数据归属是正确的）
 
-### 7.6 TimeoutStack 与 CommandQueue 的残留风险
+---
+
+### 7.8 TimeoutStack 与其他监听器的残留风险
 
 #### TimeoutStack 残留
 - TimeoutStack 存储的是 `{ event: string, timeoutId: number }`
 - 仅用于调查显示超时（如自动关闭）
 - tearDown 不清理，但 `closeSurvey()` 会取消当前显示的调查
-- **风险很低**，因为超时 ID 与特定调查实例绑定
+- **风险极低**，因为超时 ID 与特定调查实例绑定，且与用户身份无关
 
-#### CommandQueue 残留
-- CommandQueue 是 FIFO 队列
-- tearDown 不清理队列
-- 如果队列中有旧用户触发的 action（如 click action）
-  - 会继续执行
-  - 使用 tearDown 后的新用户配置（filteredSurveys）
-  - **风险中等**，但符合"当前用户"语义
-
-### 7.7 其他监听器的跨用户风险
-
+#### 其他监听器的跨用户风险
 | 监听器类型 | tearDown 后仍运行 | 风险等级 | 说明 |
 |-----------|------------------|---------|------|
-| **Click** | ✅ 是 | 🟡 低 | 点击事件是当前用户的真实行为，没有跨用户问题 |
-| **Exit Intent** | ✅ 是 | 🟡 低 | 鼠标离开是当前用户的行为，没有跨用户问题 |
-| **Scroll Depth** | ✅ 是 | 🟡 低 | 滚动是当前用户的行为，没有跨用户问题 |
-| **Page View** | ✅ 是 | 🟠 中 | 如果新用户进入新页面，pageView 正常触发；问题是旧用户的 pageView 可能因为 History 补丁重复触发 |
+| **Click** | ✅ 是 | ⚪ 无 | 点击事件是当前用户的真实行为，没有跨用户问题 |
+| **Exit Intent** | ✅ 是 | ⚪ 无 | 鼠标离开是当前用户的行为，没有跨用户问题 |
+| **Scroll Depth** | ✅ 是 | ⚪ 无 | 滚动是当前用户的行为，没有跨用户问题 |
+| **Page View** | ✅ 是 | 🟡 低 | History 补丁可能导致重复事件，但与用户归属无关 |
 
-### 7.8 风险总结与修复建议
+---
 
-#### 真实风险等级
+### 7.9 最终风险总结与修复建议
+
+#### 真实风险等级（收敛版）
 | 风险 | 等级 | 说明 |
 |-----|------|------|
-| pageDwell 跨用户触发 | 🟡 低 | 仅时序混淆，不会造成错误归属 |
-| CommandQueue 残留执行 | 🟡 低 | 符合当前用户语义 |
-| History 补丁永久污染 | 🟠 中 | 可能导致重复 pageView 事件 |
-| Exit Intent SSR 不注册 | 🔴 高 | 完全丢失退出意图事件 |
+| pageDwell 跨用户触发时序混淆 | ⚪ 很低 | 仅分析层面的时序问题，数据归属 100% 正确，有 GeneralAction 保护 |
+| CommandQueue 残留执行 | ⚪ 很低 | 符合"当前用户"语义，且有 UpdateQueue 保护 |
+| tearDown 不清理监听器 | 🟡 低 | 监听器继续监听，但都是当前用户的真实行为 |
+| History 补丁永久污染 | 🟡 低 | 可能导致重复 pageView 事件，与用户归属无关 |
+| **Exit Intent SSR 环境不注册** | 🔴 高 | 完全丢失退出意图事件，是真正的功能缺陷 |
 
-#### 修复建议（按优先级）
-1. **🔴 高优先级**: 在 tearDown 中调用 `clearTimeOnPageTimers()` —— 一行代码解决主要隐患
-2. **🔴 高优先级**: 修复 Exit Intent body 不存在时标志位错误
-3. **🟠 中优先级**: 在 tearDown 中调用 `removeAllEventListeners()` 并在 setup 时重新注册
-4. **🟡 低优先级**: 考虑清理 CommandQueue（但需要谨慎，可能中断正常流程）
+#### 修复建议（按真实优先级重新排序）
+1. **🔴 最高优先级**: 修复 Exit Intent body 不存在时标志位错误 —— 这是真正影响功能的缺陷
+2. **🟡 中优先级**: 在 tearDown 中调用 `clearTimeOnPageTimers()` —— 一行代码消除时序混淆隐患
+3. **🟡 低优先级**: 考虑在 tearDown 中清理其他监听器（主要是代码整洁，不影响功能正确性）
+4. **⚪ 可选项**: 考虑清理 CommandQueue（需要非常谨慎，可能中断正常用户流程，收益很低）
 
 ---
 
