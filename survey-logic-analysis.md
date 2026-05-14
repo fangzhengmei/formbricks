@@ -30,7 +30,7 @@ TSurveyBlockLogic {
 
 ## 2. 条件求值链路详解
 
-### 2.1 条件组结构
+### 2.1 条件组结构与短路求值
 条件组支持 **递归嵌套**，通过连接器 `AND` / `OR` 组合多个条件或子条件组：
 
 ```typescript
@@ -40,6 +40,11 @@ TConditionGroup {
   conditions: (TSingleCondition | TConditionGroup)[];
 }
 ```
+
+**短路求值行为**（代码位置：`packages/surveys/src/lib/logic.ts:28-48`）：
+- **`AND` 连接器**：使用 `Array.every()`，遇到第一个 `false` 立即停止后续求值
+- **`OR` 连接器**：使用 `Array.some()`，遇到第一个 `true` 立即停止后续求值
+- 递归求值：嵌套的条件组同样遵循短路规则
 
 ### 2.2 单个条件结构
 ```typescript
@@ -67,7 +72,7 @@ TSingleCondition {
 **步骤 2：单个条件求值（evaluateSingleCondition）**
 ```
 1. 获取左操作数值 → getLeftOperandValue()
-2. 获取右操作数值（如需要）→ getRightOperandValue()
+2. 获取右操作数值（如需要） → getRightOperandValue()
 3. 根据 operator 类型执行比较
 4. ✅ 关键：任何异常都返回 false（静默失败）
 ```
@@ -96,7 +101,7 @@ return (
   leftValue === rightValue
 );
 ```
-- 当左值是**长度为1的数组**，右值是**字符串**时，执行 `includes` 比较而非严格相等
+- 当左值是**长度为 1 的数组**，右值是**字符串**时，执行 `includes` 比较而非严格相等
 - 可能不符合直觉：`["a"] == "a"` 结果为 `true`
 
 #### 🎯 Matrix 问题的行级访问
@@ -123,34 +128,45 @@ if (leftOperand.meta && leftOperand.meta?.row !== undefined) {
 
 ### 3.2 执行顺序与关键行为
 
-**关键代码**：`logic.ts:64-79`
+**关键代码**：`packages/surveys/src/components/general/survey.tsx:698-806`
+
 ```typescript
-actions.forEach((action) => {
-  switch (action.objective) {
-    case "calculate":
-      // 执行计算并更新变量
-      break;
-    case "requireAnswer":
-      requiredQuestionIds.push(action.target);
-      break;
-    case "jumpToBlock":
-      if (!jumpTarget) {  // ⚠️ 只取第一个！
-        jumpTarget = action.target;
-      }
-      break;
-  }
-});
+// 逐条处理逻辑规则
+for (const logic of currentBlock.logic) {
+  const result = processLogicRule(logic, firstJumpTarget, allRequiredQuestionIds);
+  firstJumpTarget = result.jumpTarget;
+  // calculationResults 会被更新并传递给后续规则
+  calculationResults = result.updatedCalculations;
+}
 ```
+
+**执行顺序详解**：
+
+1. **串行执行**：同一 Block 下的多条逻辑规则按定义顺序**逐条串行执行**
+2. **变量更新传播**：前一条规则的 calculate 结果会更新 `calculationResults`，影响后续规则的条件求值
+3. **jump 优先级**：只取第一个满足条件的 jump target，后续规则的 jump 被静默忽略
 
 ### 3.3 容易误判的动作细节
 
 #### ⚠️ 多个 jumpToBlock 时只取第一个
+**代码位置**：`survey.tsx:751`
+```typescript
+const newJumpTarget = jumpTarget && !currentJumpTarget ? jumpTarget : currentJumpTarget;
+```
 - 如果条件组满足后触发多个 `jumpToBlock` 动作，**只有第一个会生效**
 - 后续的 jump 动作会被**静默忽略**，无任何警告
 - **设计意图**：避免跳转冲突，但缺乏冲突提示
 
+#### ⚠️ 变量更新影响后续规则判断
+**代码位置**：`survey.tsx:773`
+```typescript
+calculationResults = result.updatedCalculations;
+```
+- 前一条规则的 calculate 动作修改变量后，新值会**立即影响**后续规则的条件判断
+- 这意味着：**规则定义顺序非常重要**，不同顺序可能导致完全不同的跳转结果
+
 #### ➗ 除以零保护
-**代码位置**：`blocks.ts:48-54` 和 `logic.ts:505-506`
+**代码位置**：`packages/types/surveys/blocks.ts:48-54` 和 `logic.ts:505-506`
 - 定义时验证：Zod schema 会拒绝静态值为 0 的除法
 - 运行时保护：如果运行时计算出现除以零，**保持原始变量值不变**
 
@@ -167,7 +183,7 @@ actions.forEach((action) => {
 每个 Block 可以配置 `logicFallback` 字段，定义**所有逻辑规则都不满足时**的跳转目标。
 
 ```typescript
-logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
+logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 ```
 
 ### 4.2 完整的跳转决策流程
@@ -186,6 +202,7 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
           │                         │
     ┌─────┴─────┐                   │
     │ 逐条求值  │                   │
+    │ 串行执行  │                   │
     └─────┬─────┘                   │
           │                         │
   ┌───────┴───────┐                 │
@@ -200,7 +217,7 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
       │   是 ──┴── 否                │
       │   │          │               │
       │   ▼          ▼               │
-      │ 跳转目标    按顺序到下一个块  │
+      │ jumpTarget  按顺序到下一个块 │
       │   │          │               │
       └───┴──────────┴───────────────┘
                     │
@@ -218,13 +235,79 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
 | 条件求值发生异常 | 该条件返回 false，继续评估其他条件 | 🟠 高 |
 | 满足多个逻辑规则 | 逐条执行所有满足的规则的动作 | 🟡 中 |
 | 多个规则都触发 jumpToBlock | **所有规则中的第一个 jump 生效** | 🔴 严重 |
-| jumpTarget 指向不存在的 Block | 由调用方处理（可能导致问卷卡死） | 🔴 严重 |
+| jumpTarget 指向不存在的 Block | 问卷直接结束，进入 ending card | 🔴 严重 |
+| jumpTarget 指向 ending card | 问卷直接结束 | 🟡 中 |
+| 变量计算导致后续规则条件变化 | 后续规则使用更新后的变量值求值 | 🟠 高 |
 
 ---
 
-## 5. 操作符完整列表与注意事项
+## 5. 关键风险点与边界示例
 
-### 5.1 无需右操作数的操作符（12个）
+### 🚨 高风险问题
+
+#### 1. 异常静默吞噬
+- 所有条件求值异常都返回 false，不暴露错误信息
+- 可能导致：配置错误的逻辑长期不被发现
+- **示例**：引用了已删除的问题 ID，该条件永久为 false，但无任何提示
+
+#### 2. 多个 jump 冲突无提示
+- 多个规则触发 jumpToBlock 时，只取第一个
+- 无冲突警告，行为依赖规则定义顺序
+- **示例**：
+  ```
+  规则1：A == 1 → 跳转到 BlockX
+  规则2：B == 2 → 跳转到 BlockY
+  如果 A==1 且 B==2，最终跳转到 BlockX（规则1优先）
+  ```
+
+#### 3. 数组相等比较反直觉
+- `["a"] == "a"` 被判定为 true
+- 可能导致多选问题的逻辑判断不符合预期
+- **示例**：
+  ```
+  条件：多选答案 == "选项A"
+  用户选择了 ["选项A"] → 条件为 true
+  用户选择了 "选项A" → 条件为 true（取决于存储格式）
+  ```
+
+#### 4. jumpTarget 有效性无运行时验证
+- 跳转到不存在的 Block ID 时无保护机制
+- 直接导致问卷提前结束
+- **代码位置**：`survey.tsx:943-944`
+  ```typescript
+  const finished =
+    nextBlockId === undefined || !localSurvey.blocks.map((block) => block.id).includes(nextBlockId);
+  ```
+
+### ⚠️ 中等风险问题
+
+#### 5. 变量计算的副作用
+- 条件满足后执行 calculate 会修改变量值
+- 变量值变化可能影响后续条件的求值
+- **示例**：
+  ```
+  规则1：score < 100 → score += 10, 跳转到 BlockA
+  规则2：score >= 100 → 跳转到 BlockB
+  
+  如果初始 score = 95：
+  - 规则1满足，score 变为 105，设置 jump = BlockA
+  - 规则2判断时使用 score=105，也满足，但 jump 已设置，不生效
+  最终跳转：BlockA
+  ```
+
+#### 6. 多语言下的选项比较
+- MultipleChoice 选项比较使用本地化标签（label），而非 ID
+- 语言切换可能导致逻辑行为变化
+
+#### 7. Matrix 行索引越界
+- 行索引转换失败或超出范围时，静默返回 undefined
+- 最终条件返回 false，难以调试
+
+---
+
+## 6. 操作符完整列表与注意事项
+
+### 6.1 无需右操作数的操作符（12个）
 | 操作符 | 适用场景 | 注意事项 |
 |-------|---------|---------|
 | `isSubmitted` | 文件上传、文本输入等 | 空字符串、null 判定为未提交 |
@@ -237,7 +320,7 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
 | `isSet` / `isNotSet` | 隐藏字段、变量 | 非 null/undefined/空字符串 |
 | `isEmpty` / `isNotEmpty` | Matrix 行、文本 | 严格等于空字符串 |
 
-### 5.2 需要右操作数的操作符（26个）
+### 6.2 需要右操作数的操作符（26个）
 
 **比较类**：`equals`, `doesNotEqual`, `isGreaterThan`, `isLessThan`, `isGreaterThanOrEqual`, `isLessThanOrEqual`
 
@@ -249,41 +332,6 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
 
 ---
 
-## 6. 关键风险点总结
-
-### 🚨 高风险问题
-
-1. **异常静默吞噬**
-   - 所有条件求值异常都返回 false，不暴露错误信息
-   - 可能导致：配置错误的逻辑长期不被发现
-
-2. **多个 jump 冲突无提示**
-   - 多个规则触发 jumpToBlock 时，只取第一个
-   - 无冲突警告，行为依赖规则定义顺序
-
-3. **数组相等比较反直觉**
-   - `["a"] == "a"` 被判定为 true
-   - 可能导致多选问题的逻辑判断不符合预期
-
-4. **jumpTarget 有效性无运行时验证**
-   - 跳转到不存在的 Block ID 时无保护机制
-
-### ⚠️ 中等风险问题
-
-5. **变量计算的副作用**
-   - 条件满足后执行 calculate 会修改变量值
-   - 变量值变化可能影响后续条件的求值
-
-6. **多语言下的选项比较**
-   - MultipleChoice 选项比较使用本地化标签（label），而非 ID
-   - 语言切换可能导致逻辑行为变化
-
-7. **Matrix 行索引越界**
-   - 行索引转换失败或超出范围时，静默返回 undefined
-   - 最终条件返回 false，难以调试
-
----
-
 ## 7. 调试与验证建议
 
 ### 7.1 开发调试建议
@@ -292,11 +340,27 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
 3. 添加 jump 冲突检测警告
 
 ### 7.2 逻辑配置最佳实践
-1. 避免在同一 Block 中定义多个可能同时触发的 jumpToBlock 规则
-2. 对于复杂逻辑，建议拆分为多个简单 Block 而非深度嵌套条件
-3. 始终配置 `logicFallback` 作为安全网
-4. 变量计算避免循环依赖（A 满足修改 B，B 满足又修改 A）
-5. Matrix 问题的行索引从 0 开始，注意与 UI 显示的对应关系
+
+#### 🔑 规则顺序非常重要
+- 把可能产生冲突的 jump 规则按优先级排列
+- 变量计算规则放在前面，影响后续规则
+- **避免**：同一 block 中多条规则都设置 jumpToBlock
+
+#### 🎯 避免循环依赖
+- 不要让规则 A 修改变量 B，规则 B 又修改变量 A
+- 可能导致难以预测的行为
+
+#### 🛡️ 始终设置安全网
+- 建议每个 Block 都配置 `logicFallback`
+- 即使所有条件都不满足，也能控制跳转方向
+
+#### 📋 避免引用不存在的目标
+- 配置时验证 jump target 是否存在
+- 删除 Block 时检查引用它的 logic
+
+#### 🔢 Matrix 索引从 0 开始
+- logic 中 row 索引是数字，从 0 开始
+- 与 UI 显示的 1-based 序号不对应
 
 ---
 
@@ -310,3 +374,5 @@ logicFallback?: ZSurveyBlockId;  // 条件都不满足时跳转的 Block ID
 | 单个条件求值 | `packages/surveys/src/lib/logic.ts` | 206-448 |
 | Block 类型定义 | `packages/types/surveys/blocks.ts` | 124-151 |
 | 逻辑类型定义 | `packages/types/surveys/logic.ts` | 1-246 |
+| 跳转逻辑处理 | `packages/surveys/src/components/general/survey.tsx` | 698-806 |
+| 提交处理函数 | `packages/surveys/src/components/general/survey.tsx` | 919-995 |
