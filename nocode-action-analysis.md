@@ -196,7 +196,145 @@ if (!result.ok) {
 
 ---
 
-## 五、关键代码位置
+## 五、监听器生命周期与清理一致性分析
+
+### 5.1 注册与解绑对称性核对
+
+| 监听器类型 | 注册函数 | 解绑函数 | 对称状态 | 备注 |
+|-----------|---------|---------|---------|------|
+| **Page URL 事件** | `addPageUrlEventListeners` | `removePageUrlEventListeners` | ✅ 基本对称 | 但 History 补丁无法恢复 |
+| **Click 事件** | `addClickEventListener` | `removeClickEventListener` | ✅ 对称 | 目标: `document` |
+| **Exit Intent 事件** | `addExitIntentListener` | `removeExitIntentListener` | ⚠️ 不对称 | 注册目标: `document.body`, 解绑目标: `document` |
+| **Scroll Depth 事件** | `addScrollDepthListener` | `removeScrollDepthListener` | ⚠️ 潜在不对称 | `load` 事件触发后才真正注册 |
+| **PageDwell 定时器** | (内部创建) | `clearTimeOnPageTimers` | ✅ 对称 | 独立函数清理 |
+| **beforeunload 清理** | `addCleanupEventListeners` | `removeCleanupEventListeners` | ❌ **严重 Bug** | 函数引用不匹配 |
+
+### 5.2 History API 补丁的永久影响
+
+**问题描述**:
+- `addPageUrlEventListeners` 对 `history.pushState` 和 `history.replaceState` 进行 monkey patch
+- **补丁一旦应用就永远无法恢复**，因为原始函数引用只存在于函数闭包中
+- 没有提供任何恢复原始 history 方法的 API
+
+**代码位置** (`packages/js-core/src/lib/survey/no-code-action.ts:167-188`):
+```typescript
+if (!isHistoryPatched) {
+  const originalPushState = history.pushState;
+  history.pushState = function (...args) {
+    originalPushState.apply(this, args);
+    const event = new Event("pushstate");
+    window.dispatchEvent(event);
+  };
+  // ... replaceState 同样的处理
+  isHistoryPatched = true;
+}
+```
+
+**潜在影响**:
+1. **内存泄漏**: 闭包持有原始函数引用，无法被 GC
+2. **行为污染**: 即使 SDK 被"卸载"，history 方法仍然会派发额外事件
+3. **兼容性风险**: 可能与其他也 patch history 的库冲突
+4. **多次 patch 风险**: 如果 `isHistoryPatched` 标志被意外重置，可能导致嵌套 patch
+
+### 5.3 Exit Intent 监听器目标不一致
+
+**问题代码**:
+```typescript
+// 注册: no-code-action.ts:278-280
+document.querySelector("body")?.addEventListener("mouseleave", checkExitIntentWrapper);
+
+// 解绑: no-code-action.ts:286-288
+document.removeEventListener("mouseleave", checkExitIntentWrapper);
+```
+
+**问题描述**:
+- 注册时目标是 **`document.body`**
+- 解绑时目标是 **`document`**
+- 根据 DOM 事件规范，事件目标不同时，`removeEventListener` 会静默失败
+
+**实际影响**:
+- ❌ Exit Intent 监听器**永远无法被正确移除**
+- ❌ 即使调用 `removeExitIntentListener`，监听器仍然存在
+- ❌ 页面跳转后可能残留，导致重复触发或内存泄漏
+
+### 5.4 beforeunload 清理监听器的严重 Bug
+
+**问题代码** (`packages/js-core/src/lib/common/event-listeners.ts:29-55`):
+```typescript
+export const addCleanupEventListeners = (): void => {
+  if (areRemoveEventListenersAdded) return;
+  window.addEventListener("beforeunload", () => {  // 匿名函数 A
+    // ... 清理逻辑
+  });
+  areRemoveEventListenersAdded = true;
+};
+
+export const removeCleanupEventListeners = (): void => {
+  if (!areRemoveEventListenersAdded) return;
+  window.removeEventListener("beforeunload", () => {  // 匿名函数 B - 不相等!
+    // ... 相同的清理逻辑
+  });
+  areRemoveEventListenersAdded = false;
+};
+```
+
+**Bug 核心原因**:
+- `addEventListener` 和 `removeEventListener` 使用了**两个不同的匿名函数实例**
+- 在 JavaScript 中，`() => {} !== () => {}`，即使函数体完全相同
+- 因此 `removeEventListener` **静默失败**，监听器永远不会被移除
+
+**实际影响**:
+1. beforeunload 监听器永久残留
+2. 页面刷新/关闭时清理逻辑可能被多次执行
+3. 内存泄漏（闭包持有整个 SDK 状态引用）
+4. 标志位 `areRemoveEventListenersAdded` 与实际状态不一致
+
+### 5.5 Scroll Depth 监听器的时序问题
+
+**问题场景**:
+```typescript
+export const addScrollDepthListener = (): void => {
+  if (document.readyState === "complete") {
+    window.addEventListener("scroll", checkScrollDepthWrapper);
+  } else {
+    window.addEventListener("load", () => {
+      window.addEventListener("scroll", checkScrollDepthWrapper);
+    });
+  }
+  scrollDepthListenerAdded = true;
+};
+```
+
+**潜在问题**:
+1. 如果在 `load` 事件触发前调用 `removeScrollDepthListener`:
+   - 标志位设为 `false`
+   - 但 `load` 事件仍会在未来触发，最终还是会添加 scroll 监听器
+   - 导致"已移除"但实际仍在监听的不一致状态
+
+2. 没有取消 `load` 事件监听器的机制
+
+### 5.6 监听器残留对触发判断的影响
+
+| 残留监听器 | 对触发判断的影响 | 严重程度 |
+|-----------|----------------|---------|
+| **History 补丁残留** | pushState/replaceState 仍会派发自定义事件 → pageView 逻辑可能被意外触发 | 🔴 高 |
+| **Exit Intent 残留** | mouseleave 仍会检测 → 页面卸载后仍可能触发 exitIntent action | 🟠 中 |
+| **beforeunload 清理残留** | 页面卸载时清理逻辑重复执行 → 可能导致状态异常 | 🟡 低 |
+| **Scroll Depth 时序残留** | scroll 事件仍会检测滚动深度 → 页面切换后仍可能触发 | 🟠 中 |
+| **Click 监听器残留** | 点击仍会匹配元素 → 非预期页面也可能触发 click action | 🟠 中 |
+
+### 5.7 页面生命周期中的清理时机
+
+| 清理时机 | 实际行为 | 问题 |
+|---------|---------|------|
+| **beforeunload 事件** | 调用所有移除函数 + clearTimeOnPageTimers | ✅ 意图正确，但实现有 Bug |
+| **手动调用 removeAllEventListeners** | 调用所有移除函数 | ❌ History 补丁不会恢复 |
+| **SPA 页面切换** | 无自动清理 | ❌ 监听器全部残留 |
+| **热更新/HMR** | 无特殊处理 | ❌ 可能导致重复注册 |
+
+---
+
+## 六、关键代码位置
 
 | 功能模块 | 文件路径 | 核心函数 |
 |---------|---------|---------|
