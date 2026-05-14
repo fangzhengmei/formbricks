@@ -67,7 +67,7 @@ const evaluateConditionGroup = (group: TConditionGroup): boolean => {
 
 **为什么重要**：
 - 不能依赖短路行为来避免某些条件的副作用
-- 异常会中断整个 map 过程，导致整个条件组求值失败（返回 false）
+- 结构损坏类异常会中断整个 map 过程，并向上抛出，可能中断提交流程
 - 性能上：条件数较多时会有完整遍历开销
 
 ### 2.2 单个条件结构
