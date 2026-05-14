@@ -404,24 +404,202 @@ export const tearDown = (): void => {
 
 ---
 
-## 七、设计特点总结
+## 七、tearDown 跨用户触发风险专项分析
+
+### 7.1 tearDown 实际执行内容（与预期对比）
+
+| 预期应该做的 | 实际做了什么 | 缺失的影响 |
+|------------|------------|----------|
+| 清理所有监听器 | ❌ 完全不做 | 点击/滚动/退出意图监听器永久残留 |
+| 清理 pageDwell 定时器 | ❌ 完全不做 | 旧用户的定时器仍会在未来触发 |
+| 清理 TimeoutStack | ❌ 完全不做 | 超时调度残留 |
+| 清理 CommandQueue | ❌ 完全不做 | 之前排队的命令仍会执行 |
+| 重置 isSetup 标志 | ❌ 完全不做 | checkSetup 永远返回 ok |
+| 重置用户状态为默认 | ✅ 做了 | 这是 tearDown 唯一做对的事情 |
+| 重新计算 filteredSurveys | ✅ 做了 | 用 DEFAULT_USER_STATE_NO_USER_ID 过滤 |
+| 关闭当前显示的调查 | ✅ 做了 | 调用 closeSurvey() |
+
+### 7.2 跨用户触发时序推演（pageDwell 场景）
+
+#### 场景设定
+- 用户A 登录，在页面 `/dashboard` 停留
+- pageDwell action: `timeOnPage_30s`，30秒后触发
+- 用户A 有权看到 SurveyA（仅登录用户可见）
+- 匿名用户（默认）无权看到 SurveyA
+
+#### 精确时序
+```
+T0: 用户A 进入 /dashboard
+    ↓
+    checkPageUrl() 被调用
+    ↓
+    pageDwell 定时器启动（id = 123, actionName = "timeOnPage_30s"）
+    ↓
+    timeOnPageTimers.set("timeOnPage_30s", {
+      status: "running",
+      pageKey: "/dashboard",
+      timerId: 123
+    })
+
+T0+10s: 调用 setUserId("用户B") / logout()
+    ↓
+    tearDown() 被调用
+    ↓
+    ✅ Config.user = DEFAULT_USER_STATE_NO_USER_ID（匿名用户）
+    ✅ Config.filteredSurveys = filterSurveys(env, anonymousUser) → SurveyA 不在列表中
+    ✅ closeSurvey() 被调用
+    ↓
+    ❗ 注意：timeOnPageTimers 中的定时器 123 完全没有被触碰！
+    ❗ 注意：isSetup 标志仍然为 true！
+    ❗ 注意：CommandQueue 完全没有被清理！
+
+T0+29s: CommandQueue 中有用户A 之前触发的其他 action（如果有的话）
+    ↓
+    这些命令会正常执行，使用当前的（匿名用户）配置
+
+T0+30s: 定时器 123 到期触发
+    ↓
+    timeOnPageTimers.set("timeOnPage_30s", { status: "fired", pageKey: "/dashboard" })
+    ↓
+    queue.add(trackNoCodeTimeOnPageActionHandler, CommandType.GeneralAction, true, "timeOnPage_30s")
+
+T0+30s + 几毫秒: CommandQueue 执行该命令
+    ↓
+    checkSetup() → 返回 ok ✅（isSetup 仍为 true）
+    ↓
+    检查 UpdateQueue 为空，无需等待
+    ↓
+    trackAction("timeOnPage_30s") 被调用
+    ↓
+    appConfig.get().filteredSurveys → 使用当前的匿名用户配置
+    ↓
+    遍历 filteredSurveys，寻找 trigger.actionClass.name === "timeOnPage_30s"
+    ↓
+    最终结果取决于匿名用户是否有匹配的 survey trigger
+```
+
+### 7.3 真实影响边界分析
+
+| 情况 | 是否会触发 | 归属用户 | 备注 |
+|-----|-----------|---------|------|
+| **匿名用户也有相同的 pageDwell action trigger** | ✅ 会触发 | 匿名用户 | ✅ 逻辑上"正确"，但时序来源是旧用户 |
+| **只有登录用户有该 action trigger** | ❌ 不会触发 | 无 | ✅ 安全，因为 filteredSurveys 已更新为匿名用户 |
+| **触发时还在排队等待 UpdateQueue** | ✅ 会等待新用户的更新完成 | 新用户 | ⚠️ 如果 setUserId 有后端请求，可能导致混淆 |
+| **页面 URL 在定时器触发前改变了** | ❌ 不会触发 | 无 | ✅ checkTimeOnPage() 会因 URL 不匹配清理该定时器 |
+
+### 7.4 可复现条件（三个条件必须同时满足）
+
+1. **✅ 定时器启动后，页面 URL 没有发生变化**
+   - 如果 URL 变化，checkTimeOnPage 会自动清理不匹配的定时器
+   - SPA 单页应用在同一页面内切换用户最容易触发
+
+2. **✅ tearDown 时 isSetup 标志仍为 true**
+   - tearDown 不会改变 isSetup
+   - 如果 tearDown 后又重新 setup，风险相同
+
+3. **✅ 匿名用户/新用户的 filteredSurveys 包含该 pageDwell action trigger**
+   - 最常见情况：所有用户（包括匿名）都有相同的 pageDwell action
+
+### 7.5 不会造成跨用户行为归属的根本原因
+
+**核心关键: trackAction 不携带用户身份上下文，只使用 Config 中的当前用户状态**
+
+```typescript
+export const trackAction = async (name: string): Promise<Result<void, NetworkError>> => {
+  // 🔴 关键点：这里永远使用"当前"的 Config，不是启动定时器时的 Config
+  const activeSurveys = appConfig.get().filteredSurveys;  // 快照当前用户配置
+  
+  for (const survey of activeSurveys) {
+    for (const trigger of survey.triggers) {
+      if (trigger.actionClass.name === name) {
+        // 🔴 触发的是当前用户（匿名/新用户）的 survey，不是旧用户的
+        await triggerSurvey(survey, name, properties);
+      }
+    }
+  }
+};
+```
+
+**结论**: 不会把旧用户的行为"归属"到新用户，因为：
+- 新用户/匿名用户的 filteredSurveys 已经过滤掉了仅旧用户可见的 survey
+- triggerSurvey 使用当前用户上下文创建响应
+
+**但仍然有问题**: 这个 action 的触发时机来源是旧用户的行为，却在新用户身份下执行，可能造成数据分析时的时序混淆。
+
+### 7.6 TimeoutStack 与 CommandQueue 的残留风险
+
+#### TimeoutStack 残留
+- TimeoutStack 存储的是 `{ event: string, timeoutId: number }`
+- 仅用于调查显示超时（如自动关闭）
+- tearDown 不清理，但 `closeSurvey()` 会取消当前显示的调查
+- **风险很低**，因为超时 ID 与特定调查实例绑定
+
+#### CommandQueue 残留
+- CommandQueue 是 FIFO 队列
+- tearDown 不清理队列
+- 如果队列中有旧用户触发的 action（如 click action）
+  - 会继续执行
+  - 使用 tearDown 后的新用户配置（filteredSurveys）
+  - **风险中等**，但符合"当前用户"语义
+
+### 7.7 其他监听器的跨用户风险
+
+| 监听器类型 | tearDown 后仍运行 | 风险等级 | 说明 |
+|-----------|------------------|---------|------|
+| **Click** | ✅ 是 | 🟡 低 | 点击事件是当前用户的真实行为，没有跨用户问题 |
+| **Exit Intent** | ✅ 是 | 🟡 低 | 鼠标离开是当前用户的行为，没有跨用户问题 |
+| **Scroll Depth** | ✅ 是 | 🟡 低 | 滚动是当前用户的行为，没有跨用户问题 |
+| **Page View** | ✅ 是 | 🟠 中 | 如果新用户进入新页面，pageView 正常触发；问题是旧用户的 pageView 可能因为 History 补丁重复触发 |
+
+### 7.8 风险总结与修复建议
+
+#### 真实风险等级
+| 风险 | 等级 | 说明 |
+|-----|------|------|
+| pageDwell 跨用户触发 | 🟡 低 | 仅时序混淆，不会造成错误归属 |
+| CommandQueue 残留执行 | 🟡 低 | 符合当前用户语义 |
+| History 补丁永久污染 | 🟠 中 | 可能导致重复 pageView 事件 |
+| Exit Intent SSR 不注册 | 🔴 高 | 完全丢失退出意图事件 |
+
+#### 修复建议（按优先级）
+1. **🔴 高优先级**: 在 tearDown 中调用 `clearTimeOnPageTimers()` —— 一行代码解决主要隐患
+2. **🔴 高优先级**: 修复 Exit Intent body 不存在时标志位错误
+3. **🟠 中优先级**: 在 tearDown 中调用 `removeAllEventListeners()` 并在 setup 时重新注册
+4. **🟡 低优先级**: 考虑清理 CommandQueue（但需要谨慎，可能中断正常流程）
+
+---
+
+## 八、设计特点总结（最终版）
 
 ### 优点
 1. **模块化设计**: 每种事件类型独立管理，职责清晰
 2. **容错性强**: 匹配失败静默处理，不影响主流程
 3. **事件委托**: Click 事件支持祖先元素匹配，适配动态 DOM
 4. **URL 功能丰富**: 7 种匹配规则 + AND/OR 连接器，满足复杂场景
+5. **PageDwell 清理机制相对完善**: 页面切换时会主动清理不再匹配的定时器
 
-### 已发现的严重问题
-1. **🔴 beforeunload 清理监听器 Bug**: 匿名函数引用不匹配，导致永远无法移除
-2. **🔴 Exit Intent 监听器目标不一致**: 注册在 body，解绑在 document，永远无法移除
-3. **🟠 History 补丁不可恢复**: monkey patch 后无还原机制，永久污染全局
-4. **🟠 Scroll Depth 时序问题**: load 事件触发前解绑会导致"假移除"状态
+### 真实影响生产的问题（按严重程度排序）
+
+#### 🔴 高优先级（直接影响触发）
+1. **Exit Intent body 不存在时标志位错误**: 在 SSR/iframe/文档解析早期环境下，Exit Intent 监听器永远无法注册，导致退出意图 action 完全不触发
+2. **tearDown 不清理 pageDwell 定时器**: 多用户切换场景下，旧用户的定时器仍可能触发，造成数据分析时序混淆
+
+#### 🟠 中优先级（边缘场景影响）
+3. **tearDown 完全不清理监听器**: 多用户切换场景下监听器永久残留
+4. **History 补丁永久污染**: 重初始化 SDK 时 patch 仍在，可能导致 pageView 重复触发
+5. **Exit Intent 注册/解绑目标不一致**: 注册在 body，解绑在 document（虽然解绑永不被调用）
+
+#### 🟡 低优先级（仅代码质量/测试问题）
+6. **beforeunload 匿名函数不匹配**: 不影响生产功能，只影响测试可靠性
+7. **Scroll Depth 时序问题**: 极端时序下才可能出现，生产中几乎不会遇到
+
+### 测试与质量问题
+1. **解绑测试系统性假阳性**: 所有 `remove*` 测试只验证函数被调用，不验证监听器真的被移除
+2. **边界场景覆盖缺失**: 没有测试"body 不存在"、"重复 setup/tearDown"、"用户切换"等关键场景
+3. **清理代码大部分是死代码**: 90% 的清理逻辑在生产中永远不会被执行
 
 ### 其他潜在优化点
 1. **缺少匹配优先级**: 无法配置 action 优先级，完全依赖数组顺序
 2. **缺少匹配统计**: 无法知道某个 action 匹配了多少次
 3. **缺少调试钩子**: 匹配失败无日志，调试困难
-4. **正则无超时**: 恶意正则可能导致性能问题（虽然概率低）
-5. **缺少 SPA 路由切换清理**: 单页应用页面切换时无自动清理机制
-6. **缺少监听器幂等性保证**: 重复注册/移除缺乏健壮的状态校验
+4. **缺少 SPA 路由切换清理**: 单页应用页面切换时无自动清理机制
