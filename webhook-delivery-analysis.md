@@ -152,11 +152,11 @@ validateAndResolveWebhookUrl(url)
        │     │
        │     ├─ fetchWithTimeout 成功 → ✅ Promise<Response> (fulfilled)
        │     │
-       │     └─ fetchWithTimeout 失败 (网络超时/DNS失败) → 进入 catch()
+       │     └─ fetchWithTimeout 失败 (网络超时/DNS失败/TCP连接拒绝) → 进入 catch()
        │           │
        │           └─ logger.error() 但不重新抛出 → ✅ Promise<undefined> (fulfilled)
        │
-       └─ ❌ reject (URL 验证失败: 内网IP等) → 直接进入 catch()
+       └─ ❌ reject (URL 验证失败: 内网IP/非HTTPS等) → 直接进入 catch()
                  │
                  └─ logger.error() 但不重新抛出 → ✅ Promise<undefined> (fulfilled)
 ```
@@ -164,7 +164,7 @@ validateAndResolveWebhookUrl(url)
 **致命结论**:
 > **无论成功或失败，每个 webhookPromise 最终永远都是 fulfilled 状态！**
 > 
-> catch 块捕获了所有可能的错误（URL 验证失败、网络超时、DNS 解析失败等），但只记录日志，**没有重新抛出错误**。这导致 Promise 链总是以 fulfilled 状态结束（值为 Response 对象或 undefined）。
+> catch 块捕获了所有可能的错误（URL 验证失败、网络超时、DNS 解析失败、TCP 连接拒绝等），但只记录日志，**没有重新抛出错误**。这导致 Promise 链总是以 fulfilled 状态结束（值为 Response 对象或 undefined）。
 
 #### 4.1.2 Promise.allSettled 的 rejected 分支永远不会执行
 
@@ -184,11 +184,10 @@ results.forEach((result) => {
 
 | 触发失败的场景 | 是否进入 catch | catch 是否重新抛出 | Promise 最终状态 | allSettled rejected 分支是否执行 |
 |----------------|----------------|-------------------|-----------------|---------------------------------|
-| URL 验证失败 (内网IP) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| URL 验证失败 (内网IP/非HTTPS) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
 | 网络连接超时 (5s Abort) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
 | DNS 解析失败 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
 | TCP 连接被拒绝 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
-| CORS 错误 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
 | HTTP 400 Bad Request | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
 | HTTP 401 Unauthorized | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
 | HTTP 403 Forbidden | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
@@ -246,11 +245,11 @@ webhookPromises (Array<Promise>)
 
 即使是网络层错误，也会被 catch 捕获并"消化"，最终变成 fulfilled 状态。
 
-**完整的失败场景矩阵**:
+**完整的失败场景矩阵 (基于服务端 Node.js 实际运行环境)**:
 
 | 失败类型 | 是否被 catch 捕获 | 错误日志 (第174-175行) | Promise 最终状态 | allSettled rejected 日志 (第306-308行) |
 |----------|------------------|-----------------------|-----------------|----------------------------------------|
-| **URL 验证失败** (内网IP) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **URL 验证失败** (内网IP/非HTTPS) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
 | **网络连接超时** (5s Abort) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
 | **DNS 解析失败** | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
 | **TCP 连接被拒绝** | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
@@ -285,7 +284,7 @@ webhookPromises (Array<Promise>)
 - ✅ 504 Gateway Timeout - 网关超时
 - ✅ 429 Too Many Requests - 限流（可配合 Retry-After 重试）
 - ✅ 502 Bad Gateway - 上游服务重启中
-- ✅ 网络超时、DNS 临时失败、TCP 连接重置
+- ✅ 网络超时、DNS 临时失败、TCP 连接重置、连接拒绝
 
 **这些临时性错误的命运**：
 - 网络层错误 → 被 catch 捕获记录日志 → 变成 fulfilled → 被当作"成功"
@@ -421,7 +420,8 @@ const isRetriableError = (error: any): boolean => {
     error.name === 'AbortError' || 
     error.code === 'ECONNRESET' || 
     error.code === 'ETIMEDOUT' ||
-    error.code === 'ECONNREFUSED'
+    error.code === 'ECONNREFUSED' ||
+    error.code === 'ENOTFOUND' // DNS 解析失败
   ) {
     return true;
   }
@@ -497,7 +497,7 @@ interface WebhookRetryConfig {
 ```
 
 **重试条件 (可重试错误)**:
-- 网络错误 (ECONNRESET, ETIMEDOUT, ECONNREFUSED, AbortError)
+- 网络错误 (ECONNRESET, ETIMEDOUT, ECONNREFUSED, ENOTFOUND, AbortError)
 - HTTP 5xx 响应 (500, 502, 503, 504)
 - HTTP 429 Too Many Requests (需处理 Retry-After 头)
 
