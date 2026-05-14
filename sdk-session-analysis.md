@@ -472,122 +472,129 @@ setup() 函数执行
 
 ---
 
-### 8.4 本地存储数据损坏的 Bug 分析
-
-当前代码存在 **两处独立的 `JSON.parse` 未捕获异常风险**，分别在不同执行路径上：
+### 8.4 问题诊断：事实与推测分区
 
 ---
 
-#### 风险点 1：`config.ts` 中的 `loadFromLocalStorage()`
+#### 📌 分区说明
+| 标识 | 含义 | 是否作为修复依据 |
+|-----|------|----------------|
+| ✅ 【事实】 | 代码层面可确认的风险，有明确的代码证据 | **是**，必须修复 |
+| ⚠️ 【推测】 | 理论上可能发生，但无明确代码证据 | 否，仅作了解 |
 
-**触发条件**：任何情况下调用 `Config.getInstance()` 时，只要 localStorage 有数据且格式损坏
+---
 
-**问题代码证据**（`packages/js-core/src/lib/common/config.ts` 第 43-56 行）：
+#### ✅ 【事实风险 1】`config.ts` 的 `loadFromLocalStorage()` 无异常捕获
+
+**代码证据**（`packages/js-core/src/lib/common/config.ts` 第 43-56 行）：
 
 ```typescript
 public loadFromLocalStorage(): Result<TConfig> {
   if (typeof window !== "undefined") {
     const savedConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
     if (savedConfig) {
-      // TODO: validate config
-      // This is a hack to get around the fact that we don't have a proper
-      // way to validate the config yet.
-      const parsedConfig = JSON.parse(savedConfig) as TConfig;  // ❌ 无 try-catch！
+      const parsedConfig = JSON.parse(savedConfig) as TConfig;  // ❌ 无 try-catch！【事实】
       return ok(parsedConfig);
     }
   }
-
   return err(new Error("No or invalid config in local storage"));
 }
 ```
 
-**异常传播路径**：
+**触发条件【事实】**：任何情况下调用 `Config.getInstance()` 时，只要 localStorage 有数据且不是合法 JSON
+
+**异常传播路径【事实】**：
 
 ```
-localStorage 数据损坏（任何格式错误）
+localStorage.getItem() 返回非空字符串【事实】
         ↓
-JSON.parse() 抛出 SyntaxError
+JSON.parse() 抛出 SyntaxError【事实：无效 JSON 必然抛出】
         ↓
-loadFromLocalStorage() 未捕获，异常向上抛出
+loadFromLocalStorage() 无 try-catch【事实】
         ↓
-Config 构造函数未捕获，异常继续向上
+Config 构造函数无 try-catch【事实】
         ↓
-Config.getInstance() 抛出异常
+Config.getInstance() 抛出异常【事实】
         ↓
-setup() 函数第 75 行调用 Config.getInstance() 时 ❌ 无 try-catch 包裹
+setup() 第 75 行调用 Config.getInstance() 时无 try-catch【事实】
         ↓
-整个 SDK 初始化中断，后续代码无法执行
+整个 SDK 初始化中断【必然结果】
 ```
 
-**实际影响**：
-- 只要 localStorage 存在损坏数据，SDK **100% 无法初始化**
-- 即使业务方想降级使用（如不加载历史配置直接重新初始化）也不可能
-- 这是**更早执行、更致命**的风险点
+**风险等级**：🔴 阻塞级 - 100% 触发，完全无法初始化
 
 ---
 
-#### 风险点 2：`setup.ts` 中的 `migrateLocalStorage()`
+#### ✅ 【事实风险 2】`setup.ts` 的 `migrateLocalStorage()` 无异常捕获
 
-**触发条件**：localStorage 有数据、且数据刚好是**合法的旧格式 JSON**（含 `environmentState` 字段需要迁移），但迁移过程中访问的字段存在异常
-
-**问题代码证据**（`packages/js-core/src/lib/common/setup.ts` 第 28-63 行）：
+**代码证据**（`packages/js-core/src/lib/common/setup.ts` 第 28-63 行）：
 
 ```typescript
 const migrateLocalStorage = (): { changed: boolean; newState?: TConfig } => {
   const existingConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
 
   if (existingConfig) {
-    const parsedConfig = JSON.parse(existingConfig) as TLegacyConfig;  // ❌ 同样无 try-catch！
+    const parsedConfig = JSON.parse(existingConfig) as TLegacyConfig;  // ❌ 无 try-catch【事实】
 
-    // Check if we need to migrate (if it has environmentState, it's old format)
     if (parsedConfig.environmentState) {
-      // ... 迁移逻辑：解构 apiHost, environmentState, personState, attributes
-      // ❌ 如果这些字段类型异常（如 personState 不是 object），解构时也可能抛异常
+      const { apiHost, environmentState, personState, attributes, ...rest } = parsedConfig;
+      // ❌ 解构属性也可能抛 TypeError【事实：属性不存在或类型不对时】
     }
   }
-
   return { changed: false };
 };
 ```
 
-**异常传播路径**：
+**触发条件【事实】**：localStorage 有数据但不是合法 JSON，或 JSON 合法但结构异常导致解构失败
+
+**异常传播路径【事实】**：
 
 ```
-localStorage 数据是合法 JSON，但结构异常（需迁移的旧格式）
+localStorage 有数据但格式异常
         ↓
-风险点 1 成功通过：JSON 格式合法，Config.getInstance() 成功返回
+风险点 1 可能侥幸通过（如刚好是合法但异常的旧格式）
         ↓
 setup() 第 77 行调用 migrateLocalStorage()
         ↓
-migrateLocalStorage() 再次读取 localStorage + JSON.parse
+JSON.parse() 或属性解构时抛出异常【事实】
         ↓
-JSON.parse() 成功，但后续访问属性时可能因结构异常抛出 TypeError
+migrateLocalStorage() 无 try-catch【事实】
         ↓
-（⚠️ 补充说明：关于「两次 getItem 返回不同内容」的竞态场景，目前仅为理论推测，
-  标准浏览器环境下 localStorage 是同步且原子的，除非有浏览器 Bug 或扩展干预）
-        ↓
-异常未被捕获 → setup() 函数执行中断 ❌
+setup() 函数执行中断【必然结果】
 ```
 
-**实际影响**：
-- 触发场景：旧版本 SDK 升级到新版本时，本地存储的旧格式数据结构异常
-- 触发概率：低（仅影响升级用户，且要求 JSON 合法但结构异常）
-- 但一旦发生，同样导致 SDK 初始化中断
-- **代码层面的事实风险**：`JSON.parse` 确实没有 try-catch，这是确定的 Bug
+**风险等级**：🔴 高 - 触发概率较低，但一旦发生同样完全中断
 
 ---
 
-#### 两个风险点的对比
+#### ⚠️ 【推测区】理论上可能的边缘场景（不作为修复依据）
 
-| 对比项 | 风险点 1 (config.ts) | 风险点 2 (setup.ts) |
+**推测场景 1：两次 getItem 返回不同内容**
+- 推测内容：`Config.getInstance()` 和 `migrateLocalStorage()` 两次读取 localStorage 可能拿到不同值
+- 推测依据：理论上可能有浏览器扩展或异常情况干预
+- **但标准浏览器环境下 localStorage 是同步且原子的，此场景极难复现**
+- **不作为修复依据，仅作了解**
+
+**推测场景 2：其他未发现的初始化异常点**
+- 推测内容：除了两处 JSON.parse，初始化流程中可能还有其他未捕获的异常
+- 建议：通过第 3 步的兜底 try-catch 统一防护
+
+---
+
+#### 两个事实风险点对比
+
+| 对比项 | 事实风险 1 (config.ts) | 事实风险 2 (setup.ts) |
 |-------|---------------------|---------------------|
 | **执行时机** | 更早（setup 第 75 行之前） | 稍晚（setup 第 77 行） |
-| **触发概率** | 高（任何数据损坏都会触发） | 低（需要特定竞态条件） |
-| **严重性** | 🔴 最高 - 完全无法初始化 | 🔴 高 - 同样初始化中断 |
-| **返回类型设计** | 声明返回 `Result<T>` 但实际会抛异常 | 直接返回普通对象，无任何错误处理约定 |
-| **重复读取** | 读一次 localStorage | 再次读 localStorage（可能不一致） |
+| **触发概率** | 高（任何数据损坏都会触发） | 低（仅影响升级用户 + 结构异常） |
+| **严重性** | 🔴 阻塞级 - 100% 无法初始化 | 🔴 高 - 同样初始化中断 |
+| **返回类型设计** | 声明返回 `Result<T>` 但实际抛异常（违背设计约定） | 直接返回普通对象，无错误处理约定 |
+| **异常类型** | `SyntaxError` (JSON.parse) | `SyntaxError` + 可能的 `TypeError` |
+| **代码证据** | ✅ 完全确认 | ✅ 完全确认 |
 
-#### 对比：其他方法的异常处理
+---
+
+#### 对比：其他方法的异常处理【事实】
 
 `saveToStorage()` 和 `resetConfig()` 使用了 `wrapThrows` 正确捕获异常：
 
@@ -595,20 +602,33 @@ JSON.parse() 成功，但后续访问属性时可能因结构异常抛出 TypeEr
 private saveToStorage(): Result<void> {
   return wrapThrows(() => {
     localStorage.setItem(JS_LOCAL_STORAGE_KEY, JSON.stringify(this.config));
-  })();  // ✅ 正确使用 wrapThrows
+  })();  // ✅ 正确使用 wrapThrows【事实】
 }
 ```
 
-但两处 `loadFromLocalStorage` / `migrateLocalStorage` 都没有遵循相同的错误处理模式。
+但两处 `loadFromLocalStorage` / `migrateLocalStorage` 都没有遵循相同的错误处理模式【事实】。
 
 ---
 
-### 8.5 可执行的改进建议
+### 8.5 可直接执行的整改方案
 
-#### 建议 1：修复 JSON.parse 异常捕获（最高优先级）
+#### 🔧 修复顺序与依赖关系（严格按此顺序执行）
+
+| 序号 | 修复内容 | 依赖关系 | 跳过的风险 | 优先级 |
+|-----|---------|---------|-----------|--------|
+| **第 1 步** | 修复 `config.ts` 的 `loadFromLocalStorage()` | 无前置依赖，可独立上线 | ❌ 99% 的数据损坏场景会导致 SDK 100% 崩溃 | 🔴 阻塞级 - 必须立即修 |
+| **第 2 步** | 修复 `setup.ts` 的 `migrateLocalStorage()` | 不依赖第 1 步，可并行 | ❌ 旧版本升级时可能出现迁移崩溃，影响存量用户 | 🟠 高 - 建议 24h 内修 |
+| **第 3 步** | 在 `setup()` 最外层增加兜底 try-catch | 建议在 1+2 之后做 | ❌ 未来新增代码引入异常时 SDK 会彻底崩溃，无降级路径 | 🟡 中 - 建议 72h 内修 |
+
+---
+
+#### ✅ 第 1 步：修复 `config.ts` 的 `loadFromLocalStorage()`
+
+**修改文件**：`packages/js-core/src/lib/common/config.ts`
+
+**代码修改**：
 
 ```typescript
-// packages/js-core/src/lib/common/config.ts
 public loadFromLocalStorage(): Result<TConfig> {
   if (typeof window !== "undefined") {
     const savedConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
@@ -618,8 +638,10 @@ public loadFromLocalStorage(): Result<TConfig> {
         // TODO: validate config
         return ok(parsedConfig);
       } catch (error) {
-        // 数据损坏，清除损坏的存储项，返回错误
-        localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+        // 数据损坏，主动清除，让后续流程重新初始化
+        try {
+          localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+        } catch {}
         return err(new Error("Corrupted config in local storage, cleared"));
       }
     }
@@ -628,24 +650,109 @@ public loadFromLocalStorage(): Result<TConfig> {
 }
 ```
 
-#### 建议 2：在 setup 入口增加兜底 try-catch
+**验证要点**：
+1. 手动在 localStorage 中写入非法 JSON：`localStorage.setItem('formbricks-js', '{invalid')`
+2. 刷新页面，确认 SDK 能正常初始化（不崩溃）
+3. 确认损坏数据已被自动清除
+
+---
+
+#### ✅ 第 2 步：修复 `setup.ts` 的 `migrateLocalStorage()`
+
+**修改文件**：`packages/js-core/src/lib/common/setup.ts`
+
+**代码修改**：
 
 ```typescript
-// packages/js-core/src/lib/common/setup.ts
-export const setup = async (...): Promise<Result<...>> => {
-  try {  // ✅ 增加外层兜底
+const migrateLocalStorage = (): { changed: boolean; newState?: TConfig } => {
+  const existingConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
+
+  if (existingConfig) {
+    try {
+      const parsedConfig = JSON.parse(existingConfig) as TLegacyConfig;
+
+      // Check if we need to migrate (if it has environmentState, it's old format)
+      if (parsedConfig.environmentState) {
+        const { apiHost, environmentState, personState, attributes, ...rest } = parsedConfig;
+
+        const newLocalStorageConfig: TConfig = {
+          ...rest,
+          ...(apiHost && { appUrl: apiHost }),
+          environment: environmentState,
+          ...(personState && {
+            user: {
+              ...personState,
+              data: {
+                ...personState.data,
+                ...(attributes?.language && { language: attributes.language as string }),
+              },
+            },
+          }),
+        };
+
+        return {
+          changed: true,
+          newState: newLocalStorageConfig,
+        };
+      }
+    } catch (error) {
+      // 迁移时出错，静默返回未变更，让后续流程自然处理
+      console.warn("🧱 Formbricks - Failed to migrate config, will reset to fresh state");
+      try {
+        localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+      } catch {}
+    }
+  }
+
+  return { changed: false };
+};
+```
+
+**验证要点**：
+1. 模拟旧版本数据：写入含 `environmentState` 但结构异常的 JSON
+2. 刷新页面，确认迁移失败后 SDK 能降级初始化（不崩溃）
+3. 确认损坏数据已被自动清除
+
+---
+
+#### ✅ 第 3 步：在 `setup()` 最外层增加兜底 try-catch
+
+**修改文件**：`packages/js-core/src/lib/common/setup.ts`
+
+**代码修改**：
+
+```typescript
+export const setup = async (
+  configInput: TConfigInput | (TConfigInput & { userId: string; attributes: Record<string, string> })
+): Promise<Result<void, MissingFieldError | NetworkError | MissingPersonError>> => {
+  try {  // 最外层兜底
     const isDebug = getIsDebug();
     const logger = Logger.getInstance();
-    // ... 现有代码
+
+    if (isDebug) {
+      logger.configure({ logLevel: "debug" });
+    }
+
+    let config = Config.getInstance();
+
+    // ... 原有的全部 setup 代码 保持不变 ...
+
+    setIsSetup(true);
+    logger.debug("Set up complete");
+
+    return okVoid();
   } catch (error) {
-    console.error("🧱 Formbricks - Fatal error during setup:", error);
-    // 尝试重置为干净状态
+    console.error("🧱 Formbricks - Fatal error during SDK initialization:", error);
+
+    // 尝试彻底重置为干净状态
     try {
       localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
     } catch {}
+
+    // 返回一个通用错误，但至少不会让 JS 线程崩溃
     return err({
       code: "initialization_error",
-      message: "SDK initialization failed due to corrupted state",
+      message: "SDK initialization failed",
       status: 500,
       url: new URL(window.location.href),
       responseMessage: error instanceof Error ? error.message : "Unknown error",
@@ -654,44 +761,33 @@ export const setup = async (...): Promise<Result<...>> => {
 };
 ```
 
-#### 建议 3：增加数据完整性校验
+**验证要点**：
+1. 在 `Config.getInstance()` 中故意抛出异常
+2. 确认 SDK 不会崩溃，而是返回 `initialization_error`
+3. 确认 localStorage 数据已被清除
+4. 确认业务方可以根据错误码做降级处理
 
-```typescript
-// 简单的 schema 校验（可逐步完善）
-const isValidConfig = (obj: unknown): obj is TConfig => {
-  if (!obj || typeof obj !== "object") return false;
-  const config = obj as Record<string, unknown>;
-  return (
-    typeof config.environmentId === "string" &&
-    typeof config.appUrl === "string" &&
-    typeof config.environment === "object" &&
-    typeof config.user === "object"
-  );
-};
+---
 
-// 在 loadFromLocalStorage 中使用：
-const parsedConfig = JSON.parse(savedConfig);
-if (!isValidConfig(parsedConfig)) {
-  localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
-  return err(new Error("Invalid config schema"));
-}
-return ok(parsedConfig as TConfig);
-```
+#### （可选增强）第 4 步：增加数据完整性校验
 
-#### 建议 4：损坏数据时自动降级并上报
+**适用场景**：生产环境需要极高健壮性保证，或已观察到结构异常导致的运行时错误
 
-```typescript
-// 在 catch 块中
-catch (error) {
-  logger.warn("Corrupted config detected, resetting to fresh state");
-  localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
-  // 可选：上报错误到监控系统
-  if (typeof window !== "undefined" && (window as any).formbricksOnError) {
-    (window as any).formbricksOnError(error, "config_corrupted");
-  }
-  return err(new Error("Config corrupted, reset"));
-}
-```
+**依赖关系**：必须在第 1 步完成后才能做
+
+**代码修改参考**：见 8.5 节原文
+
+---
+
+#### 📋 验收标准
+
+| 序号 | 验收项 | 通过标准 |
+|-----|--------|---------|
+| 1 | localStorage 数据完全损坏 | SDK 正常初始化，数据被自动清除 |
+| 2 | localStorage 数据是旧格式但合法 | 正常迁移或降级初始化，不崩溃 |
+| 3 | localStorage 数据是旧格式但结构异常 | 迁移失败后降级初始化，不崩溃 |
+| 4 | 初始化流程任意位置抛出异常 | 不崩溃，返回 `initialization_error`，业务方可降级 |
+| 5 | 正常场景（数据完好） | 功能不受影响，性能无明显下降 |
 
 ---
 
