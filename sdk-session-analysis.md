@@ -452,11 +452,12 @@ setup() 函数执行
 
 ### 8.2 潜在改进点
 
-1. **缺少数据校验**：`loadFromLocalStorage()` 直接 `JSON.parse`，没有 schema 校验
-2. **错误状态重试机制**：当前 Error 状态只是静默等待过期，没有自动重试
-3. **UpdateQueue 失败重试**：网络失败后直接清空队列，应支持重试
-4. **存储大小限制**：localStorage 通常 5MB 限制，displays/responses 可能增长过大
-5. **缺少加密**：敏感数据（如 contactId）明文存储
+1. **🔥 严重 Bug：JSON.parse 无异常捕获**：`loadFromLocalStorage()` 直接 `JSON.parse`，数据损坏会导致 SDK 完全无法初始化（详见 8.4 节分析）
+2. **缺少数据 schema 校验**：即使 JSON 格式正确，也可能缺少必要字段，应增加基本结构校验
+3. **错误状态重试机制**：当前 Error 状态只是静默等待过期，没有自动重试
+4. **UpdateQueue 失败重试**：网络失败后直接清空队列，应支持重试
+5. **存储大小限制**：localStorage 通常 5MB 限制，displays/responses 可能增长过大
+6. **缺少加密**：敏感数据（如 contactId）明文存储
 
 ### 8.3 边缘情况处理
 
@@ -472,9 +473,15 @@ setup() 函数执行
 
 ### 8.4 本地存储数据损坏的 Bug 分析
 
-#### 问题代码证据
+当前代码存在 **两处独立的 `JSON.parse` 未捕获异常风险**，分别在不同执行路径上：
 
-**`packages/js-core/src/lib/common/config.ts` 第 43-56 行**：
+---
+
+#### 风险点 1：`config.ts` 中的 `loadFromLocalStorage()`
+
+**触发条件**：任何情况下调用 `Config.getInstance()` 时，只要 localStorage 有数据且格式损坏
+
+**问题代码证据**（`packages/js-core/src/lib/common/config.ts` 第 43-56 行）：
 
 ```typescript
 public loadFromLocalStorage(): Result<TConfig> {
@@ -496,7 +503,7 @@ public loadFromLocalStorage(): Result<TConfig> {
 **异常传播路径**：
 
 ```
-localStorage 数据损坏
+localStorage 数据损坏（任何格式错误）
         ↓
 JSON.parse() 抛出 SyntaxError
         ↓
@@ -511,13 +518,71 @@ setup() 函数第 75 行调用 Config.getInstance() 时 ❌ 无 try-catch 包裹
 整个 SDK 初始化中断，后续代码无法执行
 ```
 
-#### 实际影响
+**实际影响**：
+- 只要 localStorage 存在损坏数据，SDK **100% 无法初始化**
+- 即使业务方想降级使用（如不加载历史配置直接重新初始化）也不可能
+- 这是**更早执行、更致命**的风险点
 
-当 localStorage 中 `"formbricks-js"` 的值为无效 JSON 时（如被用户手动修改、磁盘错误、浏览器缓存损坏）：
-1. `JSON.parse()` 抛出 `SyntaxError: Unexpected token ... in JSON at position 0`
-2. 异常未被捕获，直接导致 `setup()` 函数执行失败
-3. SDK 完全无法初始化，问卷功能彻底失效
-4. 由于是初始化早期失败，甚至无法进入 Error 状态或触发降级逻辑
+---
+
+#### 风险点 2：`setup.ts` 中的 `migrateLocalStorage()`
+
+**触发条件**：localStorage 有数据、Config 单例已成功创建（即风险点 1 没触发），但数据格式刚好在某个临界状态下损坏
+
+**问题代码证据**（`packages/js-core/src/lib/common/setup.ts` 第 28-63 行）：
+
+```typescript
+const migrateLocalStorage = (): { changed: boolean; newState?: TConfig } => {
+  const existingConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
+
+  if (existingConfig) {
+    const parsedConfig = JSON.parse(existingConfig) as TLegacyConfig;  // ❌ 同样无 try-catch！
+
+    // Check if we need to migrate (if it has environmentState, it's old format)
+    if (parsedConfig.environmentState) {
+      // ... 迁移逻辑
+    }
+  }
+
+  return { changed: false };
+};
+```
+
+**异常传播路径**：
+
+```
+localStorage 数据损坏 → 但诡异的是 Config.getInstance() 居然成功了
+        ↓
+（场景：竞态条件下数据刚好半损坏，或 JSON 格式刚好能过但后续有其他问题，
+  或浏览器缓存一致性问题导致两次 getItem 返回不同内容）
+        ↓
+setup() 第 77 行调用 migrateLocalStorage()
+        ↓
+migrateLocalStorage() 内部再次 getItem + JSON.parse
+        ↓
+JSON.parse() 抛出 SyntaxError
+        ↓
+migrateLocalStorage() 未捕获
+        ↓
+setup() 函数执行中断 ❌
+```
+
+**实际影响**：
+- 触发概率相对较低，但一旦发生同样致命
+- 尤其危险场景：用户浏览器升级过程中 localStorage 数据不一致
+- 两次 `getItem` 可能拿到不同状态的数据（浏览器内部缓存问题）
+
+---
+
+#### 两个风险点的对比
+
+| 对比项 | 风险点 1 (config.ts) | 风险点 2 (setup.ts) |
+|-------|---------------------|---------------------|
+| **执行时机** | 更早（setup 第 75 行之前） | 稍晚（setup 第 77 行） |
+| **触发概率** | 高（任何数据损坏都会触发） | 低（需要特定竞态条件） |
+| **严重性** | 🔴 最高 - 完全无法初始化 | 🔴 高 - 同样初始化中断 |
+| **返回类型设计** | 声明返回 `Result<T>` 但实际会抛异常 | 直接返回普通对象，无任何错误处理约定 |
+| **重复读取** | 读一次 localStorage | 再次读 localStorage（可能不一致） |
 
 #### 对比：其他方法的异常处理
 
@@ -531,7 +596,7 @@ private saveToStorage(): Result<void> {
 }
 ```
 
-但 `loadFromLocalStorage()` 虽然返回 `Result<TConfig>` 类型，内部却没有捕获 `JSON.parse` 异常，违背了 Result 模式的约定。
+但两处 `loadFromLocalStorage` / `migrateLocalStorage` 都没有遵循相同的错误处理模式。
 
 ---
 
