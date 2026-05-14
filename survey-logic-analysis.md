@@ -30,7 +30,7 @@ TSurveyBlockLogic {
 
 ## 2. 条件求值链路详解
 
-### 2.1 条件组结构与短路求值
+### 2.1 条件组结构与求值过程
 条件组支持 **递归嵌套**，通过连接器 `AND` / `OR` 组合多个条件或子条件组：
 
 ```typescript
@@ -41,10 +41,34 @@ TConditionGroup {
 }
 ```
 
-**短路求值行为**（代码位置：`packages/surveys/src/lib/logic.ts:28-48`）：
-- **`AND` 连接器**：使用 `Array.every()`，遇到第一个 `false` 立即停止后续求值
-- **`OR` 连接器**：使用 `Array.some()`，遇到第一个 `true` 立即停止后续求值
-- 递归求值：嵌套的条件组同样遵循短路规则
+**⚠️ 重要：条件组求值过程不是短路执行**（代码位置：`packages/surveys/src/lib/logic.ts:35-45`）
+
+```typescript
+const evaluateConditionGroup = (group: TConditionGroup): boolean => {
+  // 第一步：先用 map 逐项计算所有条件结果，全部执行完毕
+  const results = group.conditions.map((condition) => {
+    if (isConditionGroup(condition)) {
+      return evaluateConditionGroup(condition);  // 递归处理嵌套组
+    } else {
+      return evaluateSingleCondition(...);        // 计算单个条件
+    }
+  });
+
+  // 第二步：用 every/some 汇总所有结果
+  return group.connector === "or" ? results.some((r) => r) : results.every((r) => r);
+};
+```
+
+**真实执行顺序**：
+1. **全部先算**：`group.conditions.map()` 会遍历并执行**所有**条件/子组，收集全部结果到 `results` 数组
+2. **再汇总**：最后才用 `every()`（AND）或 `some()`（OR）判断最终结果
+3. **无短路**：即使第一个条件已经能决定结果（如 AND 的第一个 false，OR 的第一个 true），后续条件仍会全部执行
+4. **嵌套组亦然**：嵌套的条件组同样遵循「先算完所有子项，再汇总」的模式
+
+**为什么重要**：
+- 不能依赖短路行为来避免某些条件的副作用
+- 异常会中断整个 map 过程，导致整个条件组求值失败（返回 false）
+- 性能上：条件数较多时会有完整遍历开销
 
 ### 2.2 单个条件结构
 ```typescript
@@ -64,17 +88,18 @@ TSingleCondition {
 
 ### 2.3 求值流程（evaluateLogic）
 
-**步骤 1：递归遍历条件组**
-- 从最外层条件组开始，递归处理每个子条件/子条件组
-- `AND` 连接器：所有条件为 true，结果才为 true（短路求值）
-- `OR` 连接器：任一条件为 true，结果即为 true（短路求值）
+**完整求值流程**：
+1. 调用 `evaluateConditionGroup` 处理最外层条件组
+2. **先 map 遍历**所有子项，递归处理嵌套组或计算单个条件，**全部执行完**收集到 results 数组
+3. **再用 every/some** 根据连接器汇总结果
+4. ✅ 关键：任何异常都触发 catch，整个 `evaluateLogic` 返回 false
 
-**步骤 2：单个条件求值（evaluateSingleCondition）**
+**单个条件求值（evaluateSingleCondition）**：
 ```
 1. 获取左操作数值 → getLeftOperandValue()
 2. 获取右操作数值（如需要） → getRightOperandValue()
 3. 根据 operator 类型执行比较
-4. ✅ 关键：任何异常都返回 false（静默失败）
+4. 异常捕获：任何异常都返回 false
 ```
 
 ### 2.4 容易误判的求值细节
@@ -177,16 +202,90 @@ calculationResults = result.updatedCalculations;
 
 ---
 
-## 4. 默认分支与边界情况（logicFallback）
+## 4. 最小示例：多条规则串行时变量更新改变后续规则命中
 
-### 4.1 默认分支机制
+### 4.1 场景设定
+
+假设 Block 中有 3 条规则，变量 `score` 初始值为 90：
+
+| 规则 | 条件 | 动作 |
+|-----|------|------|
+| **规则 1** | `score < 100` | calculate: score += 15<br>jumpToBlock: "BlockA" |
+| **规则 2** | `score >= 100` | jumpToBlock: "BlockB" |
+| **规则 3** | `score >= 95` | jumpToBlock: "BlockC" |
+
+### 4.2 真实执行过程
+
+```
+初始状态：score = 90, jumpTarget = undefined
+──────────────────────────────────────────────
+
+执行规则 1：
+  条件判断：score < 100 → 90 < 100 → true ✅
+  执行动作：
+    calculate: score = 90 + 15 = 105
+    jumpToBlock: jumpTarget = "BlockA"
+  状态更新：score = 105, jumpTarget = "BlockA"
+
+──────────────────────────────────────────────
+执行规则 2（使用更新后的 score）：
+  条件判断：score >= 100 → 105 >= 100 → true ✅
+  执行动作：
+    jumpToBlock: jumpTarget 已设置，忽略 → 保持 "BlockA"
+  状态更新：score = 105, jumpTarget = "BlockA"（不变）
+
+──────────────────────────────────────────────
+执行规则 3（使用更新后的 score）：
+  条件判断：score >= 95 → 105 >= 95 → true ✅
+  执行动作：
+    jumpToBlock: jumpTarget 已设置，忽略 → 保持 "BlockA"
+  状态更新：score = 105, jumpTarget = "BlockA"（不变）
+
+──────────────────────────────────────────────
+最终结果：跳转目标 = "BlockA"
+```
+
+### 4.3 关键观察
+
+1. **变量更新是即时的**：规则 1 的 calculate 结果立即影响规则 2 和规则 3 的条件判断
+2. **规则 2 和 3 本也能命中**：score 更新到 105 后，两条规则的条件都满足了
+3. **但 jump 只取第一个**：后续两条规则的 jumpToBlock 被静默忽略
+4. **顺序敏感性**：如果把规则 2 放到规则 1 前面，结果会完全不同：
+   - 规则 2 先执行：`90 >= 100` → false，不触发
+   - 规则 1 再执行：`90 < 100` → true，最终还是跳 BlockA
+   - 这个例子顺序调换结果不变，但其他场景可能不同
+
+### 4.4 更有说服力的示例：反向顺序导致不同结果
+
+| 规则 | 条件 | 动作 |
+|-----|------|------|
+| **规则 A** | `score < 100` | calculate: score = 200<br>jumpToBlock: "BlockA" |
+| **规则 B** | `score == 90` | jumpToBlock: "BlockB" |
+
+**顺序 A → B 的结果**：
+- 规则 A：score=90 < 100 → true，score 变成 200，跳 BlockA
+- 规则 B：score=200 == 90 → false，不触发
+- **最终：BlockA**
+
+**顺序 B → A 的结果**：
+- 规则 B：score=90 == 90 → true，跳 BlockB（jump 已设置）
+- 规则 A：score=90 < 100 → true，score 变成 200，但 jump 忽略
+- **最终：BlockB**
+
+✅ **结论**：规则定义顺序直接影响最终跳转结果！
+
+---
+
+## 5. 默认分支与边界情况（logicFallback）
+
+### 5.1 默认分支机制
 每个 Block 可以配置 `logicFallback` 字段，定义**所有逻辑规则都不满足时**的跳转目标。
 
 ```typescript
 logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 ```
 
-### 4.2 完整的跳转决策流程
+### 5.2 完整的跳转决策流程
 
 ```
                 用户提交当前 Block
@@ -222,10 +321,19 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
       └───┴──────────┴───────────────┘
                     │
                     ▼
-            最终跳转目标确定
+            检查 jumpTarget 有效性
+                    │
+          ┌─────────┴─────────┐
+          ▼                   ▼
+    是合法 Block?        是 ending card?
+          │                   │
+      是 ─┴─ 否            是 ─┴─ 否
+      │       │             │       │
+      ▼       ▼             ▼       ▼
+    跳转目标  ───────────► 问卷结束（结束态）
 ```
 
-### 4.3 边界场景汇总
+### 5.3 边界场景汇总
 
 | 场景 | 行为 | 风险等级 |
 |-----|------|---------|
@@ -235,13 +343,67 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 | 条件求值发生异常 | 该条件返回 false，继续评估其他条件 | 🟠 高 |
 | 满足多个逻辑规则 | 逐条执行所有满足的规则的动作 | 🟡 中 |
 | 多个规则都触发 jumpToBlock | **所有规则中的第一个 jump 生效** | 🔴 严重 |
-| jumpTarget 指向不存在的 Block | 问卷直接结束，进入 ending card | 🔴 严重 |
+| jumpTarget 指向不存在的 Block | **问卷直接结束，进入结束态** | 🔴 严重 |
 | jumpTarget 指向 ending card | 问卷直接结束 | 🟡 中 |
 | 变量计算导致后续规则条件变化 | 后续规则使用更新后的变量值求值 | 🟠 高 |
 
 ---
 
-## 5. 关键风险点与边界示例
+## 6. 无效 jump 目标落到结束态的判定条件
+
+### 6.1 判定代码
+**代码位置**：`packages/surveys/src/components/general/survey.tsx:943-944`
+
+```typescript
+const { nextBlockId, calculatedVariables } = evaluateLogicAndGetNextBlockId(surveyResponseData);
+
+const finished =
+  // 条件 1：无跳转目标（undefined）
+  nextBlockId === undefined ||
+  // 条件 2：跳转目标不在已知 blocks 列表中
+  !localSurvey.blocks.map((block) => block.id).includes(nextBlockId);
+
+setIsSurveyFinished(finished);
+```
+
+### 6.2 触发结束态的两种情况
+
+**情况 1：nextBlockId 为 undefined**
+- 没有任何规则满足，且没有 logicFallback
+- 已经是最后一个 Block，没有下一个
+- 此时 `finished = true`，问卷结束
+
+**情况 2：nextBlockId 不在 blocks 列表中**
+- jumpTarget 引用了已被删除的 Block ID
+- jumpTarget 格式错误或拼写错误
+- jumpTarget 是 ending card ID（不在 blocks 中，属于独立的 endings 数组）
+- 此时 `finished = true`，问卷直接结束
+
+### 6.3 结束后的页面跳转逻辑
+**代码位置**：`survey.tsx:964-974`
+
+```typescript
+if (nextBlockId) {
+  // 即使 finished=true，如果有 nextBlockId 还是会尝试设置
+  setBlockId(nextBlockId);
+} else if (finished) {
+  // 没有 nextBlockId 且判定为结束
+  const firstEndingId = localSurvey.endings[0]?.id as string | undefined;
+  if (firstEndingId) {
+    // 有定义 ending card，跳转到第一个
+    setBlockId(firstEndingId);
+  } else {
+    // 没有定义 ending，设置为 "end" 触发结束屏幕
+    setBlockId("end");
+  }
+}
+```
+
+**⚠️ 注意**：即使 `finished=true`，只要有 `nextBlockId` 还是会尝试跳转到该 ID，哪怕是无效的。这可能导致问卷卡死或显示空白页面。
+
+---
+
+## 7. 关键风险点总结
 
 ### 🚨 高风险问题
 
@@ -250,7 +412,11 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 - 可能导致：配置错误的逻辑长期不被发现
 - **示例**：引用了已删除的问题 ID，该条件永久为 false，但无任何提示
 
-#### 2. 多个 jump 冲突无提示
+#### 2. 条件组无短路执行
+- 所有条件都会被求值，哪怕第一个已经能决定结果
+- 可能导致：不必要的性能开销，异常影响范围扩大
+
+#### 3. 多个 jump 冲突无提示
 - 多个规则触发 jumpToBlock 时，只取第一个
 - 无冲突警告，行为依赖规则定义顺序
 - **示例**：
@@ -260,54 +426,35 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
   如果 A==1 且 B==2，最终跳转到 BlockX（规则1优先）
   ```
 
-#### 3. 数组相等比较反直觉
+#### 4. 数组相等比较反直觉
 - `["a"] == "a"` 被判定为 true
 - 可能导致多选问题的逻辑判断不符合预期
-- **示例**：
-  ```
-  条件：多选答案 == "选项A"
-  用户选择了 ["选项A"] → 条件为 true
-  用户选择了 "选项A" → 条件为 true（取决于存储格式）
-  ```
 
-#### 4. jumpTarget 有效性无运行时验证
+#### 5. jumpTarget 有效性无运行时验证
 - 跳转到不存在的 Block ID 时无保护机制
 - 直接导致问卷提前结束
-- **代码位置**：`survey.tsx:943-944`
-  ```typescript
-  const finished =
-    nextBlockId === undefined || !localSurvey.blocks.map((block) => block.id).includes(nextBlockId);
-  ```
+- **判定条件**：`!localSurvey.blocks.map((block) => block.id).includes(nextBlockId)`
 
 ### ⚠️ 中等风险问题
 
-#### 5. 变量计算的副作用
+#### 6. 变量计算的副作用
 - 条件满足后执行 calculate 会修改变量值
 - 变量值变化可能影响后续条件的求值
-- **示例**：
-  ```
-  规则1：score < 100 → score += 10, 跳转到 BlockA
-  规则2：score >= 100 → 跳转到 BlockB
-  
-  如果初始 score = 95：
-  - 规则1满足，score 变为 105，设置 jump = BlockA
-  - 规则2判断时使用 score=105，也满足，但 jump 已设置，不生效
-  最终跳转：BlockA
-  ```
+- **规则定义顺序直接影响最终结果**
 
-#### 6. 多语言下的选项比较
+#### 7. 多语言下的选项比较
 - MultipleChoice 选项比较使用本地化标签（label），而非 ID
 - 语言切换可能导致逻辑行为变化
 
-#### 7. Matrix 行索引越界
+#### 8. Matrix 行索引越界
 - 行索引转换失败或超出范围时，静默返回 undefined
 - 最终条件返回 false，难以调试
 
 ---
 
-## 6. 操作符完整列表与注意事项
+## 8. 操作符完整列表与注意事项
 
-### 6.1 无需右操作数的操作符（12个）
+### 8.1 无需右操作数的操作符（12个）
 | 操作符 | 适用场景 | 注意事项 |
 |-------|---------|---------|
 | `isSubmitted` | 文件上传、文本输入等 | 空字符串、null 判定为未提交 |
@@ -320,7 +467,7 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 | `isSet` / `isNotSet` | 隐藏字段、变量 | 非 null/undefined/空字符串 |
 | `isEmpty` / `isNotEmpty` | Matrix 行、文本 | 严格等于空字符串 |
 
-### 6.2 需要右操作数的操作符（26个）
+### 8.2 需要右操作数的操作符（26个）
 
 **比较类**：`equals`, `doesNotEqual`, `isGreaterThan`, `isLessThan`, `isGreaterThanOrEqual`, `isLessThanOrEqual`
 
@@ -332,19 +479,21 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 
 ---
 
-## 7. 调试与验证建议
+## 9. 调试与验证建议
 
-### 7.1 开发调试建议
+### 9.1 开发调试建议
 1. 在 `evaluateLogic` 和 `performActions` 中添加临时调试日志
 2. 特别关注异常捕获点，建议增加开发环境的错误提示
 3. 添加 jump 冲突检测警告
+4. 增加 jumpTarget 有效性预检查
 
-### 7.2 逻辑配置最佳实践
+### 9.2 逻辑配置最佳实践
 
 #### 🔑 规则顺序非常重要
 - 把可能产生冲突的 jump 规则按优先级排列
 - 变量计算规则放在前面，影响后续规则
 - **避免**：同一 block 中多条规则都设置 jumpToBlock
+- **谨记**：条件组求值无短路，所有条件都会执行
 
 #### 🎯 避免循环依赖
 - 不要让规则 A 修改变量 B，规则 B 又修改变量 A
@@ -357,6 +506,7 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 #### 📋 避免引用不存在的目标
 - 配置时验证 jump target 是否存在
 - 删除 Block 时检查引用它的 logic
+- 考虑在编辑器层面增加有效性检查
 
 #### 🔢 Matrix 索引从 0 开始
 - logic 中 row 索引是数字，从 0 开始
@@ -364,15 +514,16 @@ logicFallback?: string;  // 条件都不满足时跳转的 Block ID
 
 ---
 
-## 8. 关键代码位置参考
+## 10. 关键代码位置参考
 
 | 功能模块 | 文件位置 | 关键行号 |
 |---------|---------|---------|
-| 条件组求值 | `packages/surveys/src/lib/logic.ts` | 28-48 |
+| 条件组求值（map + every/some） | `packages/surveys/src/lib/logic.ts` | 35-45 |
 | 动作执行 | `packages/surveys/src/lib/logic.ts` | 50-82 |
 | 左操作数获取 | `packages/surveys/src/lib/logic.ts` | 84-181 |
 | 单个条件求值 | `packages/surveys/src/lib/logic.ts` | 206-448 |
 | Block 类型定义 | `packages/types/surveys/blocks.ts` | 124-151 |
 | 逻辑类型定义 | `packages/types/surveys/logic.ts` | 1-246 |
-| 跳转逻辑处理 | `packages/surveys/src/components/general/survey.tsx` | 698-806 |
+| 跳转逻辑处理（规则串行） | `packages/surveys/src/components/general/survey.tsx` | 698-806 |
 | 提交处理函数 | `packages/surveys/src/components/general/survey.tsx` | 919-995 |
+| 结束态判定条件 | `packages/surveys/src/components/general/survey.tsx` | 943-944 |
