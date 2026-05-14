@@ -462,11 +462,168 @@ setup() 函数执行
 
 | 场景 | 处理方式 |
 |-----|---------|
-| localStorage 被禁用 | `wrapThrows` 捕获异常，SDK 降级为无状态模式 |
-| 存储数据格式损坏 | `JSON.parse` 失败视为无配置，重新初始化 |
+| localStorage 被禁用 | `saveToStorage()`/`resetConfig()` 使用 `wrapThrows` 捕获异常，但 `loadFromLocalStorage()` 没有，详见下文 |
+| 存储数据格式损坏 | `JSON.parse` 失败**直接抛出未捕获异常**，导致 SDK 初始化中断（详见下文分析） |
 | 用户清除浏览器缓存 | 视为首次访问，重新拉取环境状态 |
 | 隐身模式/隐私浏览 | localStorage 通常可读写，但会话结束后清除 |
 | 跨子域访问 | localStorage 按 origin 隔离，需后端配合 |
+
+---
+
+### 8.4 本地存储数据损坏的 Bug 分析
+
+#### 问题代码证据
+
+**`packages/js-core/src/lib/common/config.ts` 第 43-56 行**：
+
+```typescript
+public loadFromLocalStorage(): Result<TConfig> {
+  if (typeof window !== "undefined") {
+    const savedConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
+    if (savedConfig) {
+      // TODO: validate config
+      // This is a hack to get around the fact that we don't have a proper
+      // way to validate the config yet.
+      const parsedConfig = JSON.parse(savedConfig) as TConfig;  // ❌ 无 try-catch！
+      return ok(parsedConfig);
+    }
+  }
+
+  return err(new Error("No or invalid config in local storage"));
+}
+```
+
+**异常传播路径**：
+
+```
+localStorage 数据损坏
+        ↓
+JSON.parse() 抛出 SyntaxError
+        ↓
+loadFromLocalStorage() 未捕获，异常向上抛出
+        ↓
+Config 构造函数未捕获，异常继续向上
+        ↓
+Config.getInstance() 抛出异常
+        ↓
+setup() 函数第 75 行调用 Config.getInstance() 时 ❌ 无 try-catch 包裹
+        ↓
+整个 SDK 初始化中断，后续代码无法执行
+```
+
+#### 实际影响
+
+当 localStorage 中 `"formbricks-js"` 的值为无效 JSON 时（如被用户手动修改、磁盘错误、浏览器缓存损坏）：
+1. `JSON.parse()` 抛出 `SyntaxError: Unexpected token ... in JSON at position 0`
+2. 异常未被捕获，直接导致 `setup()` 函数执行失败
+3. SDK 完全无法初始化，问卷功能彻底失效
+4. 由于是初始化早期失败，甚至无法进入 Error 状态或触发降级逻辑
+
+#### 对比：其他方法的异常处理
+
+`saveToStorage()` 和 `resetConfig()` 使用了 `wrapThrows` 正确捕获异常：
+
+```typescript
+private saveToStorage(): Result<void> {
+  return wrapThrows(() => {
+    localStorage.setItem(JS_LOCAL_STORAGE_KEY, JSON.stringify(this.config));
+  })();  // ✅ 正确使用 wrapThrows
+}
+```
+
+但 `loadFromLocalStorage()` 虽然返回 `Result<TConfig>` 类型，内部却没有捕获 `JSON.parse` 异常，违背了 Result 模式的约定。
+
+---
+
+### 8.5 可执行的改进建议
+
+#### 建议 1：修复 JSON.parse 异常捕获（最高优先级）
+
+```typescript
+// packages/js-core/src/lib/common/config.ts
+public loadFromLocalStorage(): Result<TConfig> {
+  if (typeof window !== "undefined") {
+    const savedConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
+    if (savedConfig) {
+      try {
+        const parsedConfig = JSON.parse(savedConfig) as TConfig;
+        // TODO: validate config
+        return ok(parsedConfig);
+      } catch (error) {
+        // 数据损坏，清除损坏的存储项，返回错误
+        localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+        return err(new Error("Corrupted config in local storage, cleared"));
+      }
+    }
+  }
+  return err(new Error("No or invalid config in local storage"));
+}
+```
+
+#### 建议 2：在 setup 入口增加兜底 try-catch
+
+```typescript
+// packages/js-core/src/lib/common/setup.ts
+export const setup = async (...): Promise<Result<...>> => {
+  try {  // ✅ 增加外层兜底
+    const isDebug = getIsDebug();
+    const logger = Logger.getInstance();
+    // ... 现有代码
+  } catch (error) {
+    console.error("🧱 Formbricks - Fatal error during setup:", error);
+    // 尝试重置为干净状态
+    try {
+      localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+    } catch {}
+    return err({
+      code: "initialization_error",
+      message: "SDK initialization failed due to corrupted state",
+      status: 500,
+      url: new URL(window.location.href),
+      responseMessage: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+};
+```
+
+#### 建议 3：增加数据完整性校验
+
+```typescript
+// 简单的 schema 校验（可逐步完善）
+const isValidConfig = (obj: unknown): obj is TConfig => {
+  if (!obj || typeof obj !== "object") return false;
+  const config = obj as Record<string, unknown>;
+  return (
+    typeof config.environmentId === "string" &&
+    typeof config.appUrl === "string" &&
+    typeof config.environment === "object" &&
+    typeof config.user === "object"
+  );
+};
+
+// 在 loadFromLocalStorage 中使用：
+const parsedConfig = JSON.parse(savedConfig);
+if (!isValidConfig(parsedConfig)) {
+  localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+  return err(new Error("Invalid config schema"));
+}
+return ok(parsedConfig as TConfig);
+```
+
+#### 建议 4：损坏数据时自动降级并上报
+
+```typescript
+// 在 catch 块中
+catch (error) {
+  logger.warn("Corrupted config detected, resetting to fresh state");
+  localStorage.removeItem(JS_LOCAL_STORAGE_KEY);
+  // 可选：上报错误到监控系统
+  if (typeof window !== "undefined" && (window as any).formbricksOnError) {
+    (window as any).formbricksOnError(error, "config_corrupted");
+  }
+  return err(new Error("Config corrupted, reset"));
+}
+```
 
 ---
 
