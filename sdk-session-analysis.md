@@ -452,12 +452,13 @@ setup() 函数执行
 
 ### 8.2 潜在改进点
 
-1. **🔥 严重 Bug：JSON.parse 无异常捕获**：`loadFromLocalStorage()` 直接 `JSON.parse`，数据损坏会导致 SDK 完全无法初始化（详见 8.4 节分析）
+1. **🔥 严重 Bug：两处 `JSON.parse` 均无异常捕获**：`config.ts` 和 `setup.ts` 各有一处，数据损坏会导致 SDK 完全无法初始化（详见 8.4 节完整分析）
 2. **缺少数据 schema 校验**：即使 JSON 格式正确，也可能缺少必要字段，应增加基本结构校验
-3. **错误状态重试机制**：当前 Error 状态只是静默等待过期，没有自动重试
-4. **UpdateQueue 失败重试**：网络失败后直接清空队列，应支持重试
-5. **存储大小限制**：localStorage 通常 5MB 限制，displays/responses 可能增长过大
-6. **缺少加密**：敏感数据（如 contactId）明文存储
+3. **setup 缺少外层兜底异常捕获**：任何初始化阶段的异常都会导致 SDK 彻底中断
+4. **错误状态重试机制**：当前 Error 状态只是静默等待过期，没有自动重试
+5. **UpdateQueue 失败重试**：网络失败后直接清空队列，应支持重试
+6. **存储大小限制**：localStorage 通常 5MB 限制，displays/responses 可能增长过大
+7. **缺少加密**：敏感数据（如 contactId）明文存储
 
 ### 8.3 边缘情况处理
 
@@ -527,7 +528,7 @@ setup() 函数第 75 行调用 Config.getInstance() 时 ❌ 无 try-catch 包裹
 
 #### 风险点 2：`setup.ts` 中的 `migrateLocalStorage()`
 
-**触发条件**：localStorage 有数据、Config 单例已成功创建（即风险点 1 没触发），但数据格式刚好在某个临界状态下损坏
+**触发条件**：localStorage 有数据、且数据刚好是**合法的旧格式 JSON**（含 `environmentState` 字段需要迁移），但迁移过程中访问的字段存在异常
 
 **问题代码证据**（`packages/js-core/src/lib/common/setup.ts` 第 28-63 行）：
 
@@ -540,7 +541,8 @@ const migrateLocalStorage = (): { changed: boolean; newState?: TConfig } => {
 
     // Check if we need to migrate (if it has environmentState, it's old format)
     if (parsedConfig.environmentState) {
-      // ... 迁移逻辑
+      // ... 迁移逻辑：解构 apiHost, environmentState, personState, attributes
+      // ❌ 如果这些字段类型异常（如 personState 不是 object），解构时也可能抛异常
     }
   }
 
@@ -551,26 +553,27 @@ const migrateLocalStorage = (): { changed: boolean; newState?: TConfig } => {
 **异常传播路径**：
 
 ```
-localStorage 数据损坏 → 但诡异的是 Config.getInstance() 居然成功了
+localStorage 数据是合法 JSON，但结构异常（需迁移的旧格式）
         ↓
-（场景：竞态条件下数据刚好半损坏，或 JSON 格式刚好能过但后续有其他问题，
-  或浏览器缓存一致性问题导致两次 getItem 返回不同内容）
+风险点 1 成功通过：JSON 格式合法，Config.getInstance() 成功返回
         ↓
 setup() 第 77 行调用 migrateLocalStorage()
         ↓
-migrateLocalStorage() 内部再次 getItem + JSON.parse
+migrateLocalStorage() 再次读取 localStorage + JSON.parse
         ↓
-JSON.parse() 抛出 SyntaxError
+JSON.parse() 成功，但后续访问属性时可能因结构异常抛出 TypeError
         ↓
-migrateLocalStorage() 未捕获
+（⚠️ 补充说明：关于「两次 getItem 返回不同内容」的竞态场景，目前仅为理论推测，
+  标准浏览器环境下 localStorage 是同步且原子的，除非有浏览器 Bug 或扩展干预）
         ↓
-setup() 函数执行中断 ❌
+异常未被捕获 → setup() 函数执行中断 ❌
 ```
 
 **实际影响**：
-- 触发概率相对较低，但一旦发生同样致命
-- 尤其危险场景：用户浏览器升级过程中 localStorage 数据不一致
-- 两次 `getItem` 可能拿到不同状态的数据（浏览器内部缓存问题）
+- 触发场景：旧版本 SDK 升级到新版本时，本地存储的旧格式数据结构异常
+- 触发概率：低（仅影响升级用户，且要求 JSON 合法但结构异常）
+- 但一旦发生，同样导致 SDK 初始化中断
+- **代码层面的事实风险**：`JSON.parse` 确实没有 try-catch，这是确定的 Bug
 
 ---
 
