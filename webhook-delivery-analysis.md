@@ -152,11 +152,11 @@ validateAndResolveWebhookUrl(url)
        │     │
        │     ├─ fetchWithTimeout 成功 → ✅ Promise<Response> (fulfilled)
        │     │
-       │     └─ fetchWithTimeout 失败 (网络超时/DNS失败/TCP连接拒绝) → 进入 catch()
+       │     └─ fetchWithTimeout 失败 → 进入 catch()
        │           │
        │           └─ logger.error() 但不重新抛出 → ✅ Promise<undefined> (fulfilled)
        │
-       └─ ❌ reject (URL 验证失败: 内网IP/非HTTPS等) → 直接进入 catch()
+       └─ ❌ reject (URL 校验 6 类失败之一) → 直接进入 catch()
                  │
                  └─ logger.error() 但不重新抛出 → ✅ Promise<undefined> (fulfilled)
 ```
@@ -164,7 +164,7 @@ validateAndResolveWebhookUrl(url)
 **致命结论**:
 > **无论成功或失败，每个 webhookPromise 最终永远都是 fulfilled 状态！**
 > 
-> catch 块捕获了所有可能的错误（URL 验证失败、网络超时、DNS 解析失败、TCP 连接拒绝等），但只记录日志，**没有重新抛出错误**。这导致 Promise 链总是以 fulfilled 状态结束（值为 Response 对象或 undefined）。
+> catch 块捕获了所有可能的错误（URL 校验 6 类失败、网络超时、TCP 连接被拒等），但只记录日志，**没有重新抛出错误**。这导致 Promise 链总是以 fulfilled 状态结束（值为 Response 对象或 undefined）。
 
 #### 4.1.2 Promise.allSettled 的 rejected 分支永远不会执行
 
@@ -184,16 +184,17 @@ results.forEach((result) => {
 
 | 触发失败的场景 | 是否进入 catch | catch 是否重新抛出 | Promise 最终状态 | allSettled rejected 分支是否执行 |
 |----------------|----------------|-------------------|-----------------|---------------------------------|
-| URL 验证失败 (内网IP/非HTTPS) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
-| 网络连接超时 (5s Abort) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
-| DNS 解析失败 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
-| TCP 连接被拒绝 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
-| HTTP 400 Bad Request | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
-| HTTP 401 Unauthorized | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
-| HTTP 403 Forbidden | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
-| HTTP 404 Not Found | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
-| HTTP 429 Too Many Requests | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
-| HTTP 5xx Server Error | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| **URL 校验失败 - URL 格式错误** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **URL 校验失败 - 协议错误 (非 HTTP/HTTPS)** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **URL 校验失败 - 被拦截主机名 (localhost 等)** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **URL 校验失败 - IP 字面量为内网地址** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **URL 校验失败 - DNS 解析失败/超时** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **URL 校验失败 - DNS 解析结果含内网 IP** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **网络连接超时 (5s Abort)** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **TCP 连接被拒绝** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **TCP 连接重置 (ECONNRESET)** | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| **HTTP 4xx Client Error** | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| **HTTP 5xx Server Error** | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
 
 **统计结论**:
 - **100% 的失败场景都不会进入 allSettled 的 rejected 分支**！
@@ -208,11 +209,11 @@ webhookPromises (Array<Promise>)
     │
     ├─ Promise #1
     │    ├─ validateAndResolveWebhookUrl()
-    │    │    └─ ❌ 失败 → catch() 捕获 → logger.error() → ✅ fulfilled
+    │    │    └─ ❌ 6 类 URL 校验失败 → catch() 捕获 → logger.error() → ✅ fulfilled
     │    └─ fetchWithTimeout()
     │         ├─ ✅ HTTP 2xx → ✅ fulfilled
     │         ├─ ✅ HTTP 4xx/5xx → ✅ fulfilled (未检查状态码)
-    │         └─ ❌ 网络错误 → catch() 捕获 → logger.error() → ✅ fulfilled
+    │         └─ ❌ 3 类网络错误 → catch() 捕获 → logger.error() → ✅ fulfilled
     │
     ├─ Promise #2
     │    └─ 同上...
@@ -247,23 +248,25 @@ webhookPromises (Array<Promise>)
 
 **完整的失败场景矩阵 (基于服务端 Node.js 实际运行环境)**:
 
-| 失败类型 | 是否被 catch 捕获 | 错误日志 (第174-175行) | Promise 最终状态 | allSettled rejected 日志 (第306-308行) |
-|----------|------------------|-----------------------|-----------------|----------------------------------------|
-| **URL 验证失败** (内网IP/非HTTPS) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
-| **网络连接超时** (5s Abort) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
-| **DNS 解析失败** | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
-| **TCP 连接被拒绝** | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
-| **HTTP 400 Bad Request** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
-| **HTTP 401 Unauthorized** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
-| **HTTP 403 Forbidden** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
-| **HTTP 404 Not Found** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
-| **HTTP 429 Too Many Requests** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
-| **HTTP 5xx Server Error** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| 失败类型分类 | 失败子类型 | 是否被 catch 捕获 | 错误日志 | Promise 最终状态 | allSettled rejected 分支 |
+|-------------|-----------|------------------|---------|-----------------|------------------------|
+| **A. URL 校验失败** (6 类) | URL 格式错误 | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **A. URL 校验失败** | 协议错误 (非 HTTP/HTTPS) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **A. URL 校验失败** | 被拦截主机名 (localhost 等) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **A. URL 校验失败** | IP 字面量为内网地址 | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **A. URL 校验失败** | DNS 解析失败/超时 | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **A. URL 校验失败** | DNS 解析结果含内网 IP | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **B. 网络层失败** (3 类) | 连接超时 (5s Abort) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **B. 网络层失败** | TCP 连接被拒绝 | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **B. 网络层失败** | TCP 连接重置 (ECONNRESET) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **C. HTTP 层失败** (2 大类) | HTTP 4xx Client Error | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| **C. HTTP 层失败** | HTTP 5xx Server Error | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
 
 **失败统计修正**:
-- **100% 的失败场景无法通过 allSettled 检测到**
-- **60% 的失败场景（HTTP 错误）完全没有任何日志记录**
-- **只有 40% 的失败场景（网络层错误）有日志但无法被下游逻辑感知**
+- **总计 11 类失败场景**
+- **100% (11/11) 的失败场景无法通过 allSettled 检测到**
+- **约 18% (2/11) 的失败场景（HTTP 4xx/5xx）完全没有任何日志记录**（注：4xx 含多个子状态码，但都属于同一大类）
+- **约 82% (9/11) 的失败场景（URL 校验 + 网络层）有日志但无法被下游逻辑感知**
 
 ### 4.3 对重试与告警判断的毁灭性影响
 
@@ -274,7 +277,7 @@ webhookPromises (Array<Promise>)
 2. 重试逻辑无法判断哪些需要重试
 3. 即使后续添加重试机制，也需要先：
    - 检查 `response.status`（如果是 Response 对象）
-   - 检查 `value === undefined`（如果是 catch 消化的网络错误）
+   - 检查 `value === undefined`（如果是 catch 消化的 URL/网络错误）
 4. 需要重构整个错误处理流程
 
 #### 4.3.2 可重试错误被双重忽略
@@ -282,13 +285,13 @@ webhookPromises (Array<Promise>)
 **可重试错误 (应该自动重试)**：
 - ✅ 503 Service Unavailable - 服务暂时不可用
 - ✅ 504 Gateway Timeout - 网关超时
-- ✅ 429 Too Many Requests - 限流（可配合 Retry-After 重试）
 - ✅ 502 Bad Gateway - 上游服务重启中
+- ✅ 429 Too Many Requests - 限流（可配合 Retry-After 重试）
 - ✅ 网络超时、DNS 临时失败、TCP 连接重置、连接拒绝
 
 **这些临时性错误的命运**：
-- 网络层错误 → 被 catch 捕获记录日志 → 变成 fulfilled → 被当作"成功"
-- HTTP 5xx 错误 → 变成 fulfilled → 完全静默，连日志都没有
+- 网络层/URL 校验错误 → 被 catch 捕获记录日志 → 变成 fulfilled → 被当作"成功"
+- HTTP 5xx/429 错误 → 变成 fulfilled → 完全静默，连日志都没有
 - 重试极有可能成功，但系统完全不会尝试
 
 #### 4.3.3 告警机制完全失效
@@ -330,8 +333,10 @@ webhookPromises (Array<Promise>)
 
 | 防护措施 | 实现 |
 |----------|------|
-| **协议限制** | 仅限 HTTPS（可通过环境变量放宽） |
-| **内网 IP 阻止** | 验证并解析 URL，拒绝私有/保留 IP 范围 |
+| **协议限制** | 仅限 HTTPS（可通过环境变量放宽为 HTTP） |
+| **URL 格式校验** | 必须能被 `new URL()` 正常解析 |
+| **被拦截主机名** | 阻止 localhost、metadata.google.internal 等内部服务主机名 |
+| **内网 IP 阻止** | 验证并解析 URL，拒绝 12 类私有/保留 IPv4 和 3 类 IPv6 范围 |
 | **DNS 重新绑定防护** | `createPinnedDispatcher` 固定连接 IP，防止验证后 DNS 变更 |
 | **重定向阻止** | `redirect: "manual"`，不跟随重定向 |
 
@@ -351,7 +356,7 @@ webhookPromises (Array<Promise>)
 | 签名生成 | `apps/web/lib/crypto.ts` | 184-193 |
 | 投递主逻辑 | `apps/web/app/api/(internal)/pipeline/route.ts` | 119-177 |
 | Webhook 筛选 | `apps/web/app/api/(internal)/pipeline/route.ts` | 82-91 |
-| URL 验证 | `apps/web/lib/utils/validate-webhook-url.ts` | - |
+| URL 验证 (6 类校验) | `apps/web/lib/utils/validate-webhook-url.ts` | 171-201 |
 | 测试端点 | `apps/web/modules/integrations/webhooks/lib/webhook.ts` | 169-252 |
 | Promise 结果处理 | `apps/web/app/api/(internal)/pipeline/route.ts` | 303-317 |
 | **死代码** | `apps/web/app/api/(internal)/pipeline/route.ts` | 306-308 |
@@ -402,7 +407,8 @@ return validateAndResolveWebhookUrl(webhook.url)
 
 **预期效果**:
 - HTTP 4xx/5xx 会被正确标记为失败
-- 网络错误会正确传播为 rejected 状态
+- URL 校验 6 类错误会正确传播为 rejected 状态
+- 网络层 3 类错误会正确传播为 rejected 状态
 - `allSettled` 的 rejected 分支现在能正常工作
 - 第 306-308 行的死代码"复活"了
 
@@ -502,11 +508,15 @@ interface WebhookRetryConfig {
 - HTTP 429 Too Many Requests (需处理 Retry-After 头)
 
 **不可重试错误 (直接失败)**:
+- URL 格式错误
+- 协议错误 (非 HTTP/HTTPS)
+- 被拦截主机名 (localhost 等)
+- IP 字面量为内网地址
+- DNS 解析结果含内网 IP
 - HTTP 400 Bad Request (payload 格式错误)
 - HTTP 401 Unauthorized (签名验证失败)
 - HTTP 403 Forbidden (权限不足)
 - HTTP 404 Not Found (端点不存在)
-- URL 验证失败 (内网IP等)
 
 ### 🟠 P1: 高优先级修复
 
@@ -530,6 +540,7 @@ model WebhookDelivery {
   status        WebhookDeliveryStatus
   attemptCount  Int                    @default(0)
   statusCode    Int?                   // HTTP 状态码
+  errorType     String?                // URL_VALIDATION/NETWORK/HTTP
   errorMessage  String?                // 错误详情
   requestBody   String?                // 请求体快照
   responseBody  String?                // 响应体片段
@@ -659,7 +670,7 @@ function verifyWebhookSignature(headers, payload, secret) {
 - 最近投递状态徽章（成功/失败/重试中）
 - 失败告警通知（邮件/站内信）
 - 手动重发失败 Webhook 按钮
-- Webhook 活动日志搜索筛选
+- Webhook 活动日志搜索筛选（按错误类型、状态码筛选）
 - 成功率统计图表
 
 ## 8. 总结
@@ -669,8 +680,8 @@ function verifyWebhookSignature(headers, payload, secret) {
 | 维度 | 评级 | 说明 |
 |------|------|------|
 | **签名安全性** | ✅ 良好 | 遵循 Standard Webhooks 规范 |
-| **SSRF 防护** | ✅ 优秀 | 多纵深防护机制 |
-| **Promise 错误传播** | 🔴 **致命** | catch 块不重新抛出，所有失败变成功 |
+| **SSRF 防护** | ✅ 优秀 | 6 类 URL 校验 + DNS 重新绑定防护，多层纵深防护 |
+| **Promise 错误传播** | 🔴 **致命** | catch 块不重新抛出，100% 失败变成功 |
 | **HTTP 错误处理** | 🔴 **致命** | 4xx/5xx 完全静默失败，连日志都没有 |
 | **allSettled 检测** | 🔴 严重 | 第 306-308 行是死代码，永不执行 |
 | **重试机制** | 🔴 严重 | 完全缺失 |
@@ -682,13 +693,15 @@ function verifyWebhookSignature(headers, payload, secret) {
 
 1. **Promise 错误传播完全错误** — catch 块捕获错误但不重新抛出，导致 **100% 的失败都变成 fulfilled 状态**，这是最严重的设计缺陷。
 
-2. **HTTP 响应状态完全未检查** — 60% 的失败场景（HTTP 4xx/5xx）连日志都没有，系统对外表现为"一切正常"。
+2. **HTTP 响应状态完全未检查** — HTTP 4xx/5xx 错误连日志都没有，系统对外表现为"一切正常"。
 
 3. **allSettled rejected 分支是死代码** — 第 306-308 行永远不会执行，系统无法程序化地检测到任何失败。
 
-4. **缺少重试机制** — 网络抖动、服务重启等临时性错误会导致数据永久丢失，且系统完全不自知。
+4. **URL 校验包含 6 类独立失败条件** — 格式错误、协议错误、被拦截主机名、IP 字面量为内网、DNS 解析失败/超时、DNS 解析结果含内网 IP。
 
-5. **无审计追踪** — 无法排查数据同步问题，无法证明投递成功或失败。
+5. **缺少重试机制** — 网络抖动、服务重启等临时性错误会导致数据永久丢失，且系统完全不自知。
+
+6. **无审计追踪** — 无法排查数据同步问题，无法证明投递成功或失败。
 
 ### 优先级建议汇总
 
