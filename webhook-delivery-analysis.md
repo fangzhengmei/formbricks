@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-Formbricks 的 webhook 系统用于在调查响应事件发生时向外部系统推送数据。本报告详细分析其签名验证机制、投递流程、失败处理策略以及安全性考量。重点揭示了 HTTP 错误响应处理中的严重设计缺陷。
+Formbricks 的 webhook 系统用于在调查响应事件发生时向外部系统推送数据。本报告详细分析其签名验证机制、投递流程、失败处理策略以及安全性考量。重点揭示了 Promise 状态流转和 HTTP 错误响应处理中的严重设计缺陷。
 
 ## 2. 签名机制分析
 
@@ -116,9 +116,9 @@ const webhooks = await prisma.webhook.findMany({
 
 ## 4. 失败处理与重试策略 — 深度分析
 
-### 4.1 当前实现的严重设计缺陷
+### 4.1 Promise 状态流转完整分析
 
-#### 4.1.1 核心问题：Fetch API 的行为误解
+#### 4.1.1 核心问题：catch 块"消化"了所有错误
 
 **代码证据位置**: `apps/web/app/api/(internal)/pipeline/route.ts:156-176`
 
@@ -138,102 +138,190 @@ return validateAndResolveWebhookUrl(webhook.url)
     }
   })
   .catch((error) => {
+    // 🔴 关键问题：捕获了错误但没有重新抛出！
     logger.error({ error, url: request.url }, `Webhook call to ${webhook.url} failed`);
   });
 ```
 
-**关键发现**:
-- `fetch()` API **只有在网络层面失败时才会 reject Promise**
-- HTTP 4xx/5xx 响应会被当作 **成功 resolve**，而不是 reject！
-- `.catch()` 仅捕获：
-  - 网络连接错误 (ECONNRESET, ETIMEDOUT, ECONNREFUSED)
-  - DNS 解析失败
-  - CORS 错误
-  - `validateAndResolveWebhookUrl` 抛出的异常 (URL 验证失败)
-  - AbortSignal 超时 (5秒超时)
+**Promise 状态流转图解**:
 
-#### 4.1.2 HTTP 4xx/5xx 响应的"隐形"失败
+```
+validateAndResolveWebhookUrl(url)
+       │
+       ├─ ✅ resolve(address) → 进入 then()
+       │     │
+       │     ├─ fetchWithTimeout 成功 → ✅ Promise<Response> (fulfilled)
+       │     │
+       │     └─ fetchWithTimeout 失败 (网络超时/DNS失败) → 进入 catch()
+       │           │
+       │           └─ logger.error() 但不重新抛出 → ✅ Promise<undefined> (fulfilled)
+       │
+       └─ ❌ reject (URL 验证失败: 内网IP等) → 直接进入 catch()
+                 │
+                 └─ logger.error() 但不重新抛出 → ✅ Promise<undefined> (fulfilled)
+```
+
+**致命结论**:
+> **无论成功或失败，每个 webhookPromise 最终永远都是 fulfilled 状态！**
+> 
+> catch 块捕获了所有可能的错误（URL 验证失败、网络超时、DNS 解析失败等），但只记录日志，**没有重新抛出错误**。这导致 Promise 链总是以 fulfilled 状态结束（值为 Response 对象或 undefined）。
+
+#### 4.1.2 Promise.allSettled 的 rejected 分支永远不会执行
 
 **代码证据位置**: `apps/web/app/api/(internal)/pipeline/route.ts:303-317`
 
 ```typescript
 const results = await Promise.allSettled(webhookPromises);
 results.forEach((result) => {
+  // 🔴 这个条件永远不会满足！所有 promise 都是 fulfilled
   if (result.status === "rejected") {
     logger.error({ error: result.reason, url: request.url }, "Promise rejected");
   }
 });
 ```
 
-**失败场景矩阵分析**:
+**状态流转分析表**:
 
-| 失败类型 | 是否触发 catch | 是否记录错误日志 | Promise 状态 | 实际结果 |
-|----------|----------------|------------------|-------------|----------|
-| **网络连接超时** (5s) | ✅ 是 | ✅ 是 | rejected | 正确记录 |
-| **DNS 解析失败** | ✅ 是 | ✅ 是 | rejected | 正确记录 |
-| **URL 验证失败** (内网IP) | ✅ 是 | ✅ 是 | rejected | 正确记录 |
-| **HTTP 400 Bad Request** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 401 Unauthorized** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 403 Forbidden** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 404 Not Found** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 429 Too Many Requests** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 500 Server Error** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 502 Bad Gateway** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 503 Service Unavailable** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
-| **HTTP 504 Gateway Timeout** | ❌ 否 | ❌ 否 | fulfilled | **静默失败** |
+| 触发失败的场景 | 是否进入 catch | catch 是否重新抛出 | Promise 最终状态 | allSettled rejected 分支是否执行 |
+|----------------|----------------|-------------------|-----------------|---------------------------------|
+| URL 验证失败 (内网IP) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| 网络连接超时 (5s Abort) | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| DNS 解析失败 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| TCP 连接被拒绝 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| CORS 错误 | ✅ 是 | ❌ 否 | ✅ fulfilled (值为 undefined) | ❌ **永不执行** |
+| HTTP 400 Bad Request | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| HTTP 401 Unauthorized | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| HTTP 403 Forbidden | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| HTTP 404 Not Found | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| HTTP 429 Too Many Requests | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
+| HTTP 5xx Server Error | ❌ 否 | - | ✅ fulfilled (值为 Response 对象) | ❌ **永不执行** |
 
-**严重性结论**:
-- **75% 的失败场景被完全忽略**！
-- 接收方返回的所有 HTTP 错误都被当作"成功"处理
-- 系统对投递失败完全"失明"
+**统计结论**:
+- **100% 的失败场景都不会进入 allSettled 的 rejected 分支**！
+- 第 306-308 行的失败日志记录代码是**完全死代码**，永远不会执行。
 
-### 4.2 对重试与告警判断的影响
+#### 4.1.3 失败处理层级结构总结
 
-#### 4.2.1 对重试决策的毁灭性影响
+```
+投递层级结构图：
 
-由于 HTTP 错误不会被标记为失败，导致：
-1. **可重试错误被忽略**：
-   - 503 Service Unavailable (服务暂时不可用)
-   - 504 Gateway Timeout (网关超时)
-   - 429 Too Many Requests (限流，可配合 Retry-After 重试)
-   - 502 Bad Gateway (上游服务重启中)
-   
-   这些都是典型的临时性错误，重试极有可能成功，但当前系统完全不会重试。
+webhookPromises (Array<Promise>)
+    │
+    ├─ Promise #1
+    │    ├─ validateAndResolveWebhookUrl()
+    │    │    └─ ❌ 失败 → catch() 捕获 → logger.error() → ✅ fulfilled
+    │    └─ fetchWithTimeout()
+    │         ├─ ✅ HTTP 2xx → ✅ fulfilled
+    │         ├─ ✅ HTTP 4xx/5xx → ✅ fulfilled (未检查状态码)
+    │         └─ ❌ 网络错误 → catch() 捕获 → logger.error() → ✅ fulfilled
+    │
+    ├─ Promise #2
+    │    └─ 同上...
+    │
+    └─ Promise #N
+         └─ 同上...
+              │
+              ▼
+    Promise.allSettled(webhookPromises)
+         │
+         ├─ 所有结果都是 { status: "fulfilled", value: Response|undefined }
+         └─ ❌ rejected 分支永无匹配
 
-2. **不可重试的配置错误被掩盖**：
-   - 401 Unauthorized (secret 验证失败，或 token 失效)
-   - 403 Forbidden (IP 被封禁，或权限不足)
-   - 404 Not Found (webhook 端点 URL 配置错误)
-   
-   这些需要人工介入修复的配置错误，管理员完全无法感知。
+结论：系统有两层失败静默机制！
+  1️⃣ 外层：catch 块捕获所有错误但不重新抛出
+  2️⃣ 内层：HTTP 状态码完全不检查
+```
 
-#### 4.2.2 对告警机制的破坏
+### 4.2 HTTP 4xx/5xx 响应的"双重隐形"失败
 
-由于没有失败状态记录：
-- 管理员无法通过日志发现配置错误的 webhook
-- 无法基于失败率设置告警阈值
-- 无法区分"服务不可用"与"永久配置错误"
-- 用户界面无法展示"最近投递状态"
+#### 4.2.1 第一重隐形：HTTP 状态未检查
 
-#### 4.2.3 数据一致性风险
+**代码证据**: 第 156-176 行没有任何 `response.ok` 或 `response.status` 检查
 
-- 业务系统依赖 webhook 进行数据同步时，HTTP 层面的失败会导致数据丢失
-- 没有投递状态审计，无法排查数据不一致问题
-- 无法实现"至少一次投递"的交付保证
+`fetch()` API 的标准行为是：
+- **网络层失败** → reject Promise（但会被 catch 消化）
+- **HTTP 层失败** (4xx/5xx) → **resolve** Promise，`response.ok` 为 false
 
-### 4.3 当前失败处理机制总结
+#### 4.2.2 第二重隐形：catch 块消化所有错误
+
+即使是网络层错误，也会被 catch 捕获并"消化"，最终变成 fulfilled 状态。
+
+**完整的失败场景矩阵**:
+
+| 失败类型 | 是否被 catch 捕获 | 错误日志 (第174-175行) | Promise 最终状态 | allSettled rejected 日志 (第306-308行) |
+|----------|------------------|-----------------------|-----------------|----------------------------------------|
+| **URL 验证失败** (内网IP) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **网络连接超时** (5s Abort) | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **DNS 解析失败** | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **TCP 连接被拒绝** | ✅ 是 | ✅ 有记录 | fulfilled (undefined) | ❌ 永不执行 |
+| **HTTP 400 Bad Request** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| **HTTP 401 Unauthorized** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| **HTTP 403 Forbidden** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| **HTTP 404 Not Found** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| **HTTP 429 Too Many Requests** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+| **HTTP 5xx Server Error** | ❌ 否 | ❌ 无记录 | fulfilled (Response) | ❌ 永不执行 |
+
+**失败统计修正**:
+- **100% 的失败场景无法通过 allSettled 检测到**
+- **60% 的失败场景（HTTP 错误）完全没有任何日志记录**
+- **只有 40% 的失败场景（网络层错误）有日志但无法被下游逻辑感知**
+
+### 4.3 对重试与告警判断的毁灭性影响
+
+#### 4.3.1 重试逻辑完全无法实现
+
+由于所有 promise 都是 fulfilled 状态：
+1. **没有任何程序化方式能区分成功与失败**
+2. 重试逻辑无法判断哪些需要重试
+3. 即使后续添加重试机制，也需要先：
+   - 检查 `response.status`（如果是 Response 对象）
+   - 检查 `value === undefined`（如果是 catch 消化的网络错误）
+4. 需要重构整个错误处理流程
+
+#### 4.3.2 可重试错误被双重忽略
+
+**可重试错误 (应该自动重试)**：
+- ✅ 503 Service Unavailable - 服务暂时不可用
+- ✅ 504 Gateway Timeout - 网关超时
+- ✅ 429 Too Many Requests - 限流（可配合 Retry-After 重试）
+- ✅ 502 Bad Gateway - 上游服务重启中
+- ✅ 网络超时、DNS 临时失败、TCP 连接重置
+
+**这些临时性错误的命运**：
+- 网络层错误 → 被 catch 捕获记录日志 → 变成 fulfilled → 被当作"成功"
+- HTTP 5xx 错误 → 变成 fulfilled → 完全静默，连日志都没有
+- 重试极有可能成功，但系统完全不会尝试
+
+#### 4.3.3 告警机制完全失效
+
+由于没有统一的失败状态表示：
+1. **管理员无法通过系统状态感知失败**，只能手动扫日志
+2. **无法基于失败率设置告警阈值**，因为系统认为 100% 成功
+3. **无法区分"临时不可用"与"永久配置错误"**，因为都变成了 fulfilled
+4. **用户界面无法展示"最近投递状态"**，因为没有状态数据
+5. **第 306-308 行的失败日志代码是死代码**，永远不会触发
+
+#### 4.3.4 数据一致性与可观测性风险
+
+- **业务系统无法依赖投递结果**，因为发送方自己都不知道失败了
+- **没有投递状态审计**，无法排查数据不一致问题
+- **无法实现"至少一次投递"** 的交付保证
+- **监控告警形同虚设**，系统对外表现为"一切正常"，实际上可能所有 webhook 都在失败
+
+### 4.4 当前失败处理机制总结
 
 | 维度 | 当前实现状态 | 风险等级 | 说明 |
 |------|-------------|----------|------|
-| **HTTP 状态码检查** | ❌ 完全缺失 | 🔴 致命 | 4xx/5xx 全部静默失败 |
-| **网络错误捕获** | ✅ 部分实现 | 🟡 中等 | 仅捕获网络层异常 |
+| **HTTP 状态码检查** | ❌ 完全缺失 | 🔴 致命 | 4xx/5xx 全部静默失败，连日志都没有 |
+| **Promise 错误传播** | ❌ 完全错误 | 🔴 致命 | catch 块捕获后不重新抛出，所有失败都变成 fulfilled |
+| **allSettled rejected 检测** | ❌ 死代码 | 🔴 严重 | 第 306-308 行永不执行 |
+| **网络错误捕获** | ⚠️ 部分实现 | 🟠 高 | 仅在 catch 中有日志，但无法被逻辑感知 |
 | **重试机制** | ❌ 完全缺失 | 🔴 严重 | 失败后仅记录日志，不重试 |
 | **死信队列** | ❌ 完全缺失 | 🟠 高 | 没有持久化失败记录 |
 | **退避策略** | ❌ 完全缺失 | 🟠 高 | 没有指数退避策略 |
 | **错误分类** | ❌ 完全缺失 | 🔴 严重 | 不区分可重试与不可重试 |
 | **告警机制** | ❌ 完全缺失 | 🟠 高 | 失败无告警通知 |
 | **审计记录** | ❌ 完全缺失 | 🟠 高 | 无投递状态持久化 |
-| **状态码回显** | ❌ 完全缺失 | 🟡 中等 | 无法知道响应具体内容 |
 
 ## 5. 安全性分析
 
@@ -267,12 +355,13 @@ results.forEach((result) => {
 | URL 验证 | `apps/web/lib/utils/validate-webhook-url.ts` | - |
 | 测试端点 | `apps/web/modules/integrations/webhooks/lib/webhook.ts` | 169-252 |
 | Promise 结果处理 | `apps/web/app/api/(internal)/pipeline/route.ts` | 303-317 |
+| **死代码** | `apps/web/app/api/(internal)/pipeline/route.ts` | 306-308 |
 
 ## 7. 改进建议 — 按风险优先级排序
 
 ### 🔴 P0: 立即修复（致命缺陷）
 
-#### 7.1.1 增加 HTTP 响应状态码检查
+#### 7.1.1 修复 Promise 错误传播问题
 
 **修改位置**: `apps/web/app/api/(internal)/pipeline/route.ts:156-176`
 
@@ -289,7 +378,7 @@ return validateAndResolveWebhookUrl(webhook.url)
         dispatcher,
       });
       
-      // 关键修复：检查 HTTP 状态码
+      // 修复 1：增加 HTTP 状态码检查
       if (!response.ok) {
         const responseBody = await response.text().catch(() => "");
         throw new Error(
@@ -307,17 +396,16 @@ return validateAndResolveWebhookUrl(webhook.url)
       { error, webhookId: webhook.id, webhookUrl: webhook.url, event },
       `Webhook delivery failed`
     );
-    // 重新抛出，让 allSettled 能捕获到失败状态
+    // 🔴 修复 2：关键！重新抛出错误，让 allSettled 能检测到 rejected
     throw error;
   });
 ```
 
 **预期效果**:
 - HTTP 4xx/5xx 会被正确标记为失败
-- 失败原因包含状态码和响应体，便于排查
-- `allSettled` 可以正确识别失败的 Promise
-
-### 🔴 P0: 立即修复（严重可靠性问题）
+- 网络错误会正确传播为 rejected 状态
+- `allSettled` 的 rejected 分支现在能正常工作
+- 第 306-308 行的死代码"复活"了
 
 #### 7.1.2 实现基础重试机制
 
@@ -329,7 +417,12 @@ const INITIAL_DELAY = 1000; // 1秒
 
 const isRetriableError = (error: any): boolean => {
   // 网络错误总是可重试
-  if (error.name === 'AbortError' || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
+  if (
+    error.name === 'AbortError' || 
+    error.code === 'ECONNRESET' || 
+    error.code === 'ETIMEDOUT' ||
+    error.code === 'ECONNREFUSED'
+  ) {
     return true;
   }
   
@@ -350,10 +443,33 @@ const fetchWithRetry = async (
   attempt: number = 0
 ): Promise<Response> => {
   try {
-    return await fetchWithTimeout(webhook.url, options);
+    const address = await validateAndResolveWebhookUrl(webhook.url);
+    const dispatcher = address ? createPinnedDispatcher(address) : undefined;
+    
+    try {
+      const response = await fetchWithTimeout(webhook.url, {
+        ...options,
+        dispatcher,
+      });
+      
+      if (!response.ok) {
+        const responseBody = await response.text().catch(() => "");
+        throw new Error(
+          `HTTP ${response.status}: ${response.statusText}. Body: ${responseBody.substring(0, 500)}`
+        );
+      }
+      
+      return response;
+    } finally {
+      await dispatcher?.destroy();
+    }
   } catch (error) {
     // 如果是最后一次尝试，或者错误不可重试，直接抛出
     if (attempt >= MAX_RETRIES - 1 || !isRetriableError(error)) {
+      logger.error(
+        { error, webhookId: webhook.id, webhookUrl: webhook.url, attempt: attempt + 1 },
+        `Webhook delivery failed, no more retries`
+      );
       throw error;
     }
     
@@ -554,25 +670,32 @@ function verifyWebhookSignature(headers, payload, secret) {
 |------|------|------|
 | **签名安全性** | ✅ 良好 | 遵循 Standard Webhooks 规范 |
 | **SSRF 防护** | ✅ 优秀 | 多纵深防护机制 |
-| **HTTP 错误处理** | 🔴 **致命** | 4xx/5xx 完全静默失败 |
+| **Promise 错误传播** | 🔴 **致命** | catch 块不重新抛出，所有失败变成功 |
+| **HTTP 错误处理** | 🔴 **致命** | 4xx/5xx 完全静默失败，连日志都没有 |
+| **allSettled 检测** | 🔴 严重 | 第 306-308 行是死代码，永不执行 |
 | **重试机制** | 🔴 严重 | 完全缺失 |
 | **状态追踪** | 🟠 高风险 | 无投递历史 |
 | **告警机制** | 🟠 高风险 | 完全缺失 |
-| **整体可靠性** | 🔴 严重 | 交付保证缺失 |
+| **整体可靠性** | 🔴 严重 | 交付保证完全缺失 |
 
 ### 核心发现
 
-1. **HTTP 响应状态完全未检查** — 这是最严重的设计缺陷。75% 的失败场景被系统忽略，管理员和用户完全无法感知。
+1. **Promise 错误传播完全错误** — catch 块捕获错误但不重新抛出，导致 **100% 的失败都变成 fulfilled 状态**，这是最严重的设计缺陷。
 
-2. **缺少重试机制** — 网络抖动、服务重启等临时性错误会导致数据永久丢失。
+2. **HTTP 响应状态完全未检查** — 60% 的失败场景（HTTP 4xx/5xx）连日志都没有，系统对外表现为"一切正常"。
 
-3. **无审计追踪** — 无法排查数据同步问题，无法证明投递成功或失败。
+3. **allSettled rejected 分支是死代码** — 第 306-308 行永远不会执行，系统无法程序化地检测到任何失败。
+
+4. **缺少重试机制** — 网络抖动、服务重启等临时性错误会导致数据永久丢失，且系统完全不自知。
+
+5. **无审计追踪** — 无法排查数据同步问题，无法证明投递成功或失败。
 
 ### 优先级建议汇总
 
 | 优先级 | 改进项 | 预期收益 | 工作量估计 |
 |--------|--------|----------|------------|
-| 🔴 **P0** | 增加 HTTP 状态码检查 | 修复 75% 的"隐形失败" | 1-2 小时 |
+| 🔴 **P0** | 修复 catch 块错误传播（重新抛出） | 让 allSettled 能检测到失败 | 15 分钟 |
+| 🔴 **P0** | 增加 HTTP 状态码检查 | 修复所有"隐形失败" | 1-2 小时 |
 | 🔴 **P0** | 实现基础重试逻辑 | 显著提高投递成功率 | 4-6 小时 |
 | 🟠 **P1** | 新增 WebhookDelivery 模型 | 支持审计与状态追踪 | 1-2 天 |
 | 🟠 **P1** | 实现失败告警与自动禁用 | 主动发现配置问题 | 1 天 |
@@ -580,4 +703,8 @@ function verifyWebhookSignature(headers, payload, secret) {
 | 🟡 **P2** | 强化签名验证文档 | 帮助用户正确实现验证 | 4 小时 |
 | 🟢 **P3** | UI 展示投递历史与状态 | 改善用户体验 | 2-3 天 |
 
-**建议立即实施 P0 级别的修复**，这两个改动可以解决当前系统中最严重的可靠性问题。其他改进可按优先级逐步推进。
+**建议立即实施前两个 P0 级别的修复**（共约 2 小时工作量），这两个改动可以解决当前系统中最严重的可靠性问题：
+1. 在 catch 块末尾添加 `throw error`（15 分钟）
+2. 添加 `response.ok` 检查和 HTTP 错误抛出（1-2 小时）
+
+完成这两个修复后，所有失败才能被系统正确感知，后续的重试、告警、状态追踪才有意义。
