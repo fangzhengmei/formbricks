@@ -110,19 +110,38 @@ export const ZSurveyElementBase = z.object({
 
 问卷采用 Block-Element 二级结构，一个 Block 可包含多个 Element：
 
-**文件**: `packages/types/surveys/blocks.ts` (核心结构)
+**文件**: `packages/types/surveys/blocks.ts:124-151`
 
 ```typescript
-export const ZSurveyBlock = z.object({
-  id: z.cuid2(),
-  type: z.literal("Default("question"),
-  elements: ZSurveyElements,  // 多个问题元素
-  logic: ZSurveyBlockLogic[],  // 区块级逻辑
-  logicFallback: z.string().optional(),  // 逻辑fallback
-  buttonLabel: ZI18nString.optional(),
-  backButtonLabel: ZI18nString.optional(),
-});
+export const ZSurveyBlock = z
+  .object({
+    id: ZSurveyBlockId, // CUID 格式
+    name: z.string().min(1, {
+      error: "Block name is required",
+    }), // 必填，用于编辑器
+    elements: ZSurveyElements.min(1, {
+      error: "Block must have at least one element",
+    }),
+    logic: z.array(ZSurveyBlockLogic).optional(),
+    logicFallback: ZSurveyBlockId.optional(), // 必须是有效的 block ID
+    buttonLabel: ZI18nString.optional(),
+    backButtonLabel: ZI18nString.optional(),
+  })
+  .superRefine((block, ctx) => {
+    // 校验 element ID 在 block 内唯一
+    const elementIds = block.elements.map((e) => e.id);
+    const uniqueElementIds = new Set(elementIds);
+    if (uniqueElementIds.size !== elementIds.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Element IDs must be unique within a block",
+        path: [elementIds.findIndex((id, index) => elementIds.indexOf(id) !== index), "id"],
+      });
+    }
+  });
 ```
+
+> **修正点**：Block 没有 `type` 字段，有必填的 `name` 字段；`id` 是 CUID 格式；`elements` 至少需要 1 个元素；`logicFallback` 必须是有效的 block ID。
 
 ---
 
@@ -262,8 +281,8 @@ export const ZResponse = z.object({
 | 题型 | 值类型 | 示例值 | 说明 |
 |------|--------|--------|------|
 | **OpenText** | `string` | `"hello"` | 直接文本内容 |
-| **MultipleChoiceSingle** | `string` | `"choice_abc123"` 或 `"是"` | 选项ID或选项标签文本；`""` 表示选中"其他"但未填写 |
-| **MultipleChoiceMulti** | `string[]` | `["choice1", "choice2", "", "其他文本"]` | 选中的选项ID/标签；`""` + 下一个元素为"其他"文本 |
+| **MultipleChoiceSingle** | `string` | `"是"` | **存储的是选项标签文本(label)，不是选项ID**；`""` 表示选中"其他"但未填写 |
+| **MultipleChoiceMulti** | `string[]` | `["选项A", "选项B", "", "其他自定义文本"]` | **存储的是选中的选项标签文本数组，不是ID**；`""` 是"other"的哨兵值，下一个元素为用户输入的自定义文本 |
 | **NPS** | `number` | `9` | 0-10 评分 |
 | **Rating** | `number` | `3` | 1-5/3/4/6/7/10 评分 |
 | **Consent** | `string` | `"accepted"` 或 `""` | `"accepted"` 表示同意 |
@@ -271,12 +290,26 @@ export const ZResponse = z.object({
 | **Date** | `string` | `"2024-01-15"` | ISO格式日期 |
 | **PictureSelection** | `string[]` | `["pic1", "pic2"]` | 选中的图片ID |
 | **FileUpload** | `string[]` | `["https://.../file1.pdf"]` | 上传文件URL数组 |
-| **Matrix** | `Record<string, string>` | `{"Row 1": "Column 2", "Row 2": "Column 1"}` | rowLabel → columnLabel |
+| **Matrix** | `Record<string, string>` | `{"满意度": "非常满意", "易用性": "一般"}` | **rowLabel → columnLabel，不是rowId → columnId** |
 | **Address** | `string[]` | `["123 Main St", "", "Beijing", "", "100000", "China"]` | 按 [addressLine1, addressLine2, city, state, zip, country] 顺序 |
 | **Ranking** | `string[]` | `["choice2", "choice1", "choice3"]` | 按排名顺序的选项ID |
 | **ContactInfo** | `string[]` | `["Zhang", "San", "zhang@example.com", "", ""]` | 按 [firstName, lastName, email, phone, company] 顺序 |
 | **CSAT/CES** | `number` | `4` | 1-5 或 1-7 评分 |
 | **Cal** | `string` | `"booked"` 或 `""` | `"booked"` 表示已预约 |
+
+> **修正点**：MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID；Matrix 存储的是 rowLabel → columnLabel。
+
+#### 多选 "other" 存储格式详解
+
+**文件**: `multiple-choice-multi-element.tsx:94-144`
+
+| 格式类型 | 示例 | 说明 |
+|---------|------|------|
+| **当前格式** | `["选项A", "", "自定义文本"]` | 空字符串 `""` 作为"other"哨兵值，紧跟自定义文本 |
+| **历史兼容格式1** | `["选项A", "other", "自定义文本"]` | 使用 `"other"` 作为哨兵值 |
+| **历史兼容格式2** | `["选项A", "自定义文本"]` | 无哨兵值，直接存储自定义文本 |
+
+> 向后兼容：组件读取时支持上述 3 种格式；写入时统一使用当前格式（空字符串哨兵）。
 
 ### 4.3 答案写回流程
 
@@ -404,7 +437,7 @@ const validateElementForm = (element, form) => {
 **文件**: `packages/types/surveys/logic.ts`
 
 ```typescript
-// 条件操作符
+// 条件操作符（共 32 种）
 export const ZSurveyLogicConditionsOperator = z.enum([
   "equals", "doesNotEqual", "contains", "doesNotContain",
   "startsWith", "doesNotStartWith", "endsWith", "doesNotEndWith",
@@ -464,9 +497,12 @@ export const ZSurveyBlockLogicAction = z.discriminatedUnion("objective", [
 
 ### 5.2 逻辑评估流程
 
-**文件**: `packages/surveys/src/lib/logic.ts:28-48
+**文件**: `packages/surveys/src/lib/logic.ts:28-48`
+
+> **修正点**：`evaluateLogic` 仅负责**评估条件是否成立**，返回 `boolean`；**动作执行**由独立的 `performActions` 函数完成。两者分开调用：先 `evaluateLogic`，条件成立后再 `performActions`。
 
 ```typescript
+// evaluateLogic 仅返回 boolean，表示条件组是否成立
 export const evaluateLogic = (
   localSurvey, data, variablesData, conditions, selectedLanguage) => {
   const evaluateConditionGroup = (group) => {
@@ -483,11 +519,128 @@ export const evaluateLogic = (
   };
   return evaluateConditionGroup(conditions);
 };
+
+// performActions 负责执行动作，返回执行结果
+export const performActions = (survey, actions, data, calculationResults) => {
+  let jumpTarget;
+  const requiredQuestionIds = [];
+  const calculations = { ...calculationResults };
+
+  actions.forEach(action => {
+    switch (action.objective) {
+      case "calculate":
+        const result = performCalculation(survey, action, data, calculations);
+        if (result !== undefined) calculations[action.variableId] = result;
+        break;
+      case "requireAnswer":
+        requiredQuestionIds.push(action.target);
+        break;
+      case "jumpToBlock":
+        if (!jumpTarget) jumpTarget = action.target;
+        break;
+    }
+  });
+
+  return { jumpTarget, requiredQuestionIds, calculations };
+};
 ```
 
 ### 5.3 左操作数取值与答案数据结构的耦合
 
 **文件**: `logic.ts:84-180`
+
+> **核心耦合点**：从 `TResponseData` 取出原始值后，必须根据 `element.type` 进行**类型转换**后才能用于逻辑比较。
+
+#### 5.3.1 单选题（MultipleChoiceSingle）取值转换
+
+```typescript
+// 存储值（标签文本）: { "q1": "选项A" }
+// 转换后（选项ID）: "choice_abc123" 或 "other"
+if (currentQuestion.type === "multipleChoiceSingle" || currentQuestion.type === "multipleChoiceMulti") {
+  const isOthersEnabled = currentQuestion.choices.some((c) => c.id === "other");
+
+  if (typeof responseValue === "string") {
+    // 通过标签文本查找对应的选项ID
+    const choice = currentQuestion.choices.find((choice) => {
+      return getLocalizedValue(choice.label, selectedLanguage) === responseValue;
+    });
+
+    if (!choice) {
+      return isOthersEnabled ? "other" : undefined;
+    }
+    return choice.id;  // 返回选项ID，用于后续比较
+  }
+}
+```
+
+#### 5.3.2 多选题（MultipleChoiceMulti）取值转换
+
+```typescript
+// 存储值（标签数组）: { "q1": ["选项A", "选项B", "", "自定义文本"] }
+// 转换后（选项ID数组）: ["choice_abc123", "choice_def456", "other"]
+else if (Array.isArray(responseValue)) {
+  let choices: string[] = [];
+  responseValue.forEach((value) => {
+    const foundChoice = currentQuestion.choices.find((choice) => {
+      return getLocalizedValue(choice.label, selectedLanguage) === value;
+    });
+
+    if (foundChoice) {
+      choices.push(foundChoice.id);
+    } else if (isOthersEnabled) {
+      choices.push("other");
+    }
+  });
+  return Array.from(new Set(choices));  // 去重后的选项ID数组
+}
+```
+
+#### 5.3.3 矩阵题（Matrix）取值转换
+
+**必须通过 `leftOperand.meta.row` 指定行索引**：
+
+```typescript
+// 存储值: { "q2": {"满意度": "非常满意", "易用性": "一般"} }
+// meta.row = "0"  → 取第1行的值 → 返回列索引的字符串形式: "2"
+if (currentQuestion.type === "matrix" && typeof responseValue === "object") {
+  if (leftOperand.meta && leftOperand.meta?.row !== undefined) {
+    const rowIndex = Number(leftOperand.meta.row);
+    if (isNaN(rowIndex) || rowIndex < 0 || rowIndex >= currentQuestion.rows.length) {
+      return undefined;
+    }
+
+    const rowLabel = getLocalizedValue(currentQuestion.rows[rowIndex].label, selectedLanguage);
+    const rowValue = responseValue[rowLabel];  // "非常满意"
+
+    if (rowValue) {
+      const columnIndex = currentQuestion.columns.findIndex((column) => {
+        return getLocalizedValue(column.label, selectedLanguage) === rowValue;
+      });
+      return columnIndex === -1 ? undefined : columnIndex.toString();  // 返回 "2"
+    }
+  }
+}
+```
+
+#### 5.3.4 日期题（Date）特殊比较逻辑
+
+**文件**: `logic.ts:264-270, 309-315, 415-418`
+
+存储值是 ISO 格式字符串（如 `"2024-01-15"`），在 `evaluateSingleCondition` 中进行特殊转换：
+
+```typescript
+case "equals":
+  if ((leftField as TSurveyElement).type === TSurveyElementTypeEnum.Date) {
+    // 字符串 → Date 对象 → 时间戳比较
+    return new Date(leftValue).getTime() === new Date(rightValue).getTime();
+  }
+case "isAfter":
+  return new Date(String(leftValue)) > new Date(String(rightValue));
+case "isBefore":
+  return new Date(String(leftValue)) < new Date(String(rightValue));
+```
+
+#### 5.3.5 完整取值流程
 
 ```typescript
 const getLeftOperandValue = (localSurvey, data, variablesData, leftOperand, selectedLanguage) => {
@@ -495,40 +648,36 @@ const getLeftOperandValue = (localSurvey, data, variablesData, leftOperand, sele
     case "element":
       const questions = getElementsFromSurveyBlocks(localSurvey.blocks);
       const currentQuestion = questions.find(q => q.id === leftOperand.value);
+      if (!currentQuestion) return undefined;
+
       const responseValue = data[leftOperand.value];  // 从 TResponseData 中取值
 
-      // 根据题型进行类型转换
+      // OpenText number 类型转数字
       if (currentQuestion.type === "openText" && currentQuestion.inputType === "number") {
-        return Number(responseValue);  // 转数字
+        if (responseValue === undefined) return undefined;
+        if (typeof responseValue === "string" && responseValue.trim() === "") return undefined;
+        const numberValue = typeof responseValue === "number" ? responseValue : Number(responseValue);
+        return isNaN(numberValue) ? undefined : numberValue;
       }
 
-      if (currentQuestion.type === "multipleChoiceSingle" || "multipleChoiceMulti") {
-        // 将标签文本映射回选项ID
-        if (typeof responseValue === "string") {
-          const choice = currentQuestion.choices.find(c =>
-            getLocalizedValue(c.label, selectedLanguage) === responseValue
-          );
-          return choice?.id;
-        }
-        // 处理 "other"选项
+      // 单选/多选：标签 → 选项ID
+      if (currentQuestion.type === "multipleChoiceSingle" || currentQuestion.type === "multipleChoiceMulti") {
+        // ... 如上所示
       }
 
+      // 矩阵：通过 meta.row 索引取特定行 → 返回列索引字符串
       if (currentQuestion.type === "matrix") {
-        // 处理 matrix 的 meta.row 索引 → 取特定行的值
-        if (leftOperand.meta?.row !== undefined) {
-          const rowIndex = Number(leftOperand.meta.row);
-          const row = getLocalizedValue(currentQuestion.rows[rowIndex].label, selectedLanguage);
-          const rowValue = responseValue[row];
-          // 映射列索引
-        }
+        // ... 如上所示
       }
 
-      return responseValue;  // 原始值
+      return responseValue;  // 其他类型返回原始值
 
     case "variable":
-      return getVariableValue(...);
+      return getVariableValue(variables, leftOperand.value, variablesData);
     case "hiddenField":
       return data[leftOperand.value];
+    default:
+      return undefined;
   }
 };
 ```
@@ -589,34 +738,135 @@ export const performActions = (survey, actions, data, calculationResults) => {
 };
 ```
 
-### 5.6 Survey 层逻辑整合
+### 5.6 validateBlockResponses 与 required 判定的衔接关系
 
-**文件**: `survey.tsx:697-805
+> **修正点**：动态 required 影响的是**下一个 block** 的验证，不是当前 block。
+
+#### 完整时序流程
+
+```
+用户在 Block A 填写答案
+    ↓
+用户点击 "Next" 按钮
+    ↓
+[BlockConditional.handleBlockSubmit]
+    ├─ 1. validateBlockResponses(block.elements, value, languageCode)
+    │   │  使用的是**原始的** block.elements（动态 required 尚未设置）
+    │   └─ 内部调用 checkRequiredField(element, value, t)
+    │       └─ 检查 element.required（静态值）
+    ├─ 2. 如有错误 → 显示错误并停止
+    └─ 3. 验证通过 → 调用 onSubmit(blockResponses, blockTtc)
+            ↓
+[Survey.handleBlockSubmit]
+    ├─ 1. evaluateLogicAndGetNextBlockId(surveyResponseData)
+    │   ├─ 遍历 Block A 的所有 logic 规则
+    │   ├─ 对每条规则：
+    │   │   ├─ evaluateLogic() → boolean（条件是否成立）
+    │   │   └─ 条件成立 → performActions()
+    │   │       ├─ jumpTarget（跳转目标）
+    │   │       ├─ requiredQuestionIds（需要设为必填的 element ID）
+    │   │       └─ calculations（变量计算结果）
+    │   ├─ handleRequiredQuestions(allRequiredQuestionIds)
+    │   │   └─ makeQuestionsRequired(requiredIds)
+    │   │       └─ 修改 localSurvey state: element.required = true
+    │   └─ 返回 nextBlockId
+    ├─ 2. onResponseCreateOrUpdate() → 发送到服务器
+    └─ 3. setBlockId(nextBlockId) → 跳转到 Block B
+            ↓
+用户在 Block B 填写答案
+    ↓
+用户点击 "Next" 按钮
+    ↓
+[BlockConditional.handleBlockSubmit]
+    └─ 1. validateBlockResponses(block.elements, value, languageCode)
+        └─ 使用的是**修改后的** block.elements（element.required = true）
+```
+
+#### 关键代码验证
+
+**文件**: `survey.tsx:631-648` (makeQuestionsRequired 修改 state)
+
+```typescript
+const makeQuestionsRequired = (requiredQuestionIds: string[]): void => {
+  const updateElementIfRequired = (element: TSurveyElement) => {
+    if (requiredQuestionIds.includes(element.id)) {
+      return { ...element, required: true };  // 修改 element.required
+    }
+    return element;
+  };
+
+  const updateBlockElements = (block: TSurveyBlock) => ({
+    ...block,
+    elements: block.elements.map(updateElementIfRequired),
+  });
+
+  // 更新 localSurvey state
+  setlocalSurvey((prevSurvey) => ({
+    ...prevSurvey,
+    blocks: prevSurvey.blocks.map(updateBlockElements),
+  }));
+};
+```
+
+**文件**: `block-conditional.tsx:310-349` (先验证再提交)
+
+```typescript
+const handleBlockSubmit = (e?: Event) => {
+  // 第一步：集中式校验（此时动态 required 还未设置）
+  const errorMap = validateBlockResponses(block.elements, value, languageCode);
+  if (Object.keys(errorMap).length > 0) {
+    setElementErrors(errorMap);
+    return;  // 验证失败，不提交
+  }
+
+  // 第二步：传统HTML校验（兼容层）
+  const firstInvalidForm = findFirstInvalidForm();
+  if (firstInvalidForm) {
+    return;  // 验证失败，不提交
+  }
+
+  // 第三步：验证通过后才提交
+  const blockTtc = collectTtcValues();
+  const blockResponses = collectBlockResponses();
+  onSubmit(blockResponses, blockTtc);  // 触发 Survey 层逻辑
+};
+```
+
+### 5.7 Survey 层逻辑整合
+
+**文件**: `survey.tsx:697-805`
 
 ```typescript
 const evaluateLogicAndGetNextBlockId = (data) => {
   // 1. 遍历当前 block 的所有 logic 规则
-  for (const logic of currentBlock.logic) {
-    // 2. 评估条件
-    const isLogicMet = evaluateLogic(
-      localSurvey, localResponseData, calculationResults, logic.conditions, selectedLanguage);
+  let allRequiredQuestionIds: string[] = [];
 
-    if (isLogicMet) {
-      // 3. 执行动作
-      const { jumpTarget, requiredQuestionIds, calculations } = performActions(...);
-      // 4. 动态设置必填
-      makeQuestionsRequired(requiredQuestionIds);
-      // 5. 设置跳转目标
-      firstJumpTarget = jumpTarget;
+  if (currentBlock.logic && currentBlock.logic.length > 0) {
+    for (const logic of currentBlock.logic) {
+      // 2. 评估条件（仅返回 boolean）
+      const isLogicMet = evaluateLogic(
+        localSurvey, localResponseData, calculationResults, logic.conditions, selectedLanguage);
+
+      if (isLogicMet) {
+        // 3. 执行动作（分离关注点）
+        const { jumpTarget, requiredQuestionIds, calculations } = performActions(...);
+        // 4. 收集需要动态设为必填的题目
+        allRequiredQuestionIds = [...allRequiredQuestionIds, ...requiredQuestionIds];
+        // 5. 设置跳转目标（第一个命中的优先）
+        firstJumpTarget = firstJumpTarget ?? jumpTarget;
+      }
     }
   }
 
-  // 6. 无匹配时使用 logicFallback
+  // 6. 修改 localSurvey state（影响下一个 block）
+  handleRequiredQuestions(allRequiredQuestionIds);
+
+  // 7. 无匹配时使用 logicFallback
   if (!firstJumpTarget && currentBlock.logicFallback) {
     firstJumpTarget = currentBlock.logicFallback;
   }
 
-  // 7. 返回下一个 block ID
+  // 8. 返回下一个 block ID
   return firstJumpTarget || localSurvey.blocks[currentBlockIndex + 1]?.id;
 };
 ```
@@ -693,3 +943,105 @@ evaluateLogic() 从 TResponseData 取值
 | 验证评估 | `packages/surveys/src/lib/validation/evaluator.ts` | validateElementResponse / validateBlockResponses |
 | OpenText组件 | `packages/surveys/src/components/elements/open-text-element.tsx` | 文本输入示例 |
 | 单选组件 | `packages/surveys/src/components/elements/multiple-choice-single-element.tsx` | 单选示例 |
+
+---
+
+## 八、已修正清单（错误点 → 正确代码事实）
+
+本小节逐条列出初始分析中的错误点，以及经过代码核对后的正确结论。
+
+### 8.1 Block Schema 定义错误
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | `ZSurveyBlock` 有 `type: z.literal("Default("question")` 字段 |
+| **正确事实** | Block 没有 `type` 字段，有必填的 `name: z.string().min(1)` 字段（用于编辑器）；`id` 是 CUID 格式；`elements` 至少需要 1 个元素；`logicFallback` 必须是有效的 block ID |
+| **代码证据** | `packages/types/surveys/blocks.ts:124-151` |
+
+### 8.2 单选/多选答案存储格式错误
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 单选答案存储选项 ID，多选答案存储选项 ID 数组 |
+| **正确事实** | 单选和多选答案存储的都是**标签文本(label)**，不是选项 ID |
+| | 单选：`{ [elementId]: "选项A的标签文本" }` |
+| | 多选：`{ [elementId]: ["选项A标签", "选项B标签", ...] }` |
+| | 多选 "other" 用空字符串 `""` 作为哨兵值，格式为 `["", "用户输入的自定义文本"]` |
+| **代码证据** | 单选写回：`multiple-choice-single-element.tsx:94-100` |
+| | 多选写回：`multiple-choice-multi-element.tsx:217-236` |
+| | 逻辑评估时转换：`logic.ts:107-141` |
+
+### 8.3 逻辑条件操作符数量错误
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 有 38 种逻辑条件操作符 |
+| **正确事实** | `ZSurveyLogicConditionsOperator` 定义了 **32 种**操作符 |
+| **代码证据** | `packages/types/surveys/logic.ts:5-38` |
+
+### 8.4 动态 required 的生效时机错误
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 动态 required 在当前 block 提交时的 validateBlockResponses 中生效 |
+| **正确事实** | 动态 required 通过修改 `localSurvey` state 中的 `element.required` 字段，影响的是**下一个 block** 的验证，不是当前 block |
+| **时序说明** | 1. 当前 block 提交 → 2. validateBlockResponses（使用原始 required）→ 3. 验证通过 → 4. evaluateLogic → 5. performActions → 6. makeQuestionsRequired 修改 state → 7. 跳转到下一个 block → 8. 下一个 block 提交时使用修改后的 required |
+| **代码证据** | 修改 state：`survey.tsx:631-648` |
+| | 先验证后提交：`block-conditional.tsx:310-349` |
+
+### 8.5 evaluateLogic 与 performActions 职责划分错误
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | `evaluateLogic` 同时负责条件评估和动作执行 |
+| **正确事实** | `evaluateLogic` 仅返回 `boolean`（条件组是否成立）；`performActions` 负责执行动作，返回 `{ jumpTarget, requiredQuestionIds, calculations }`；两者是**分离调用**的：先 `evaluateLogic`，条件成立后再 `performActions` |
+| **代码证据** | `logic.ts:28-48`（evaluateLogic） |
+| | `logic.ts:50-82`（performActions） |
+| | 调用顺序：`survey.tsx:727-748` |
+
+### 8.6 多选 "other" 存储格式不完整
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 仅提到用空字符串 `""` 作为哨兵值 |
+| **正确事实** | 支持 3 种存储格式（向后兼容）： |
+| | 1. **当前格式**：`["选项A", "", "自定义文本"]` - 空字符串哨兵 |
+| | 2. **历史格式1**：`["选项A", "other", "自定义文本"]` - "other" 哨兵 |
+| | 3. **历史格式2**：`["选项A", "自定义文本"]` - 无哨兵 |
+| | 逻辑评估时统一转换为 `["choiceId1", "choiceId2", "other"]` |
+| **代码证据** | 读取检测：`multiple-choice-multi-element.tsx:94-113` |
+| | 逻辑转换：`logic.ts:107-141` |
+
+### 8.7 日期题条件判断比较方式不完整
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 未提及日期题的特殊比较逻辑 |
+| **正确事实** | 日期题在 `evaluateSingleCondition` 中有特殊处理，统一转换为 `Date` 对象比较： |
+| | `equals`/`doesNotEqual`：`new Date(leftValue).getTime() === new Date(rightValue).getTime()` |
+| | `isAfter`/`isBefore`：`new Date(String(leftValue)) > new Date(String(rightValue))` |
+| **代码证据** | `logic.ts:264-270, 309-315, 415-418` |
+
+### 8.8 矩阵题取值转换细节不完整
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 仅提到存储格式是 rowLabel → columnLabel |
+| **正确事实** | 补充： |
+| | 1. 必须通过 `leftOperand.meta.row` 指定**行索引**（数字字符串，如 `"0"`） |
+| | 2. 转换后返回的是**列索引的字符串形式**（如 `"2"` 表示第 3 列） |
+| | 3. 行索引越界或列标签不匹配时返回 `undefined` |
+| **代码证据** | `logic.ts:143-170` |
+
+### 8.9 validateBlockResponses 与 required 判定的衔接关系不清晰
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 未清晰说明动态 required 如何传递到验证流程 |
+| **正确事实** | 完整衔接流程： |
+| | 1. **当前 block 提交前**：`block-conditional.tsx:316` 调用 `validateBlockResponses(block.elements, value, languageCode)`，使用**原始的** `block.elements`（动态 required 未设置） |
+| | 2. **当前 block 提交后**：`survey.tsx:697-796` 调用 `evaluateLogicAndGetNextBlockId` → 评估逻辑 → 执行动作 → 收集 `requiredQuestionIds` → 调用 `makeQuestionsRequired(requiredIds)` 修改 `localSurvey` state |
+| | 3. **下一个 block 提交时**：使用**修改后的** `element.required` 进行验证 |
+| **代码证据** | 验证调用：`block-conditional.tsx:316` |
+| | state 修改：`survey.tsx:631-648` |
+| | 完整流程：`survey.tsx:697-796` |
