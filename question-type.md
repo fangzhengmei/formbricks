@@ -297,16 +297,26 @@ export const ZResponse = z.object({
 | **CSAT/CES** | `number` | `4` | 1-5 或 1-7 评分 |
 | **Cal** | `string` | `"booked"` 或 `""` | `"booked"` 表示已预约 |
 
-> **修正点**：MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID；Matrix 存储的是 rowLabel → columnLabel；多选 other 写回时**没有空字符串哨兵**，哨兵仅用于兼容读取。
+> **修正点**：MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID；Matrix 存储的是 rowLabel → columnLabel；多选 other 写回时**没有空字符串哨兵**，哨兵格式仅用于历史兼容读取，不会被现行代码写入。
 
 #### 多选 "other" 存储格式详解
 
+**统一口径**：现行写入代码始终产生**无哨兵**格式；空字符串 `""`、`"other"` ID 等哨兵格式仅用于向后兼容读取，不会被写入。
+
+##### 现行写入格式（两段写回路径）
+
 **文件**: `multiple-choice-multi-element.tsx:168-175, 217-236`
 
-##### 实际写回格式（当前）
-
 ```typescript
-// handleMultiSelectChange: 用户选择/取消选择时
+// 路径1：用户在"其他"输入框输入时
+const handleOtherValueChange = (newOtherValue: string) => {
+  setOtherValue(newOtherValue);
+  const baseLabels = getNormalizedSelectedLabels();  // 已选标签（不含哨兵、不含other）
+  const nextValue = [...baseLabels, newOtherValue];  // 直接追加自定义文本，无哨兵
+  onChange({ [element.id]: nextValue });
+};
+
+// 路径2：用户选择/取消选择选项时
 const handleMultiSelectChange = (selectedIds: string[]) => {
   const nextLabels: string[] = [];
   const isOtherNowSelected = Boolean(otherOption) && selectedIds.includes(otherOption!.id);
@@ -318,31 +328,73 @@ const handleMultiSelectChange = (selectedIds: string[]) => {
   });
 
   if (isOtherNowSelected) {
-    nextLabels.push(otherValue);  // 直接追加自定义文本，无哨兵
+    nextLabels.push(otherValue);  // 直接追加 otherValue，无哨兵
   }
 
   onChange({ [element.id]: nextLabels });
 };
-
-// handleOtherValueChange: 用户在"其他"输入框输入时
-const handleOtherValueChange = (newOtherValue: string) => {
-  setOtherValue(newOtherValue);
-  const baseLabels = getNormalizedSelectedLabels();
-  const nextValue = [...baseLabels, newOtherValue];  // 直接追加，无哨兵
-  onChange({ [element.id]: nextValue });
-};
 ```
 
-##### 读取时兼容的历史格式
+**现行写入格式示例**：`["产品A", "产品B", "用户输入的自定义文本"]`
 
-| 格式类型 | 示例 | 说明 |
-|---------|------|------|
-| **当前写回格式** | `["选项A", "选项B", "自定义文本"]` | 直接追加自定义文本，无哨兵 |
-| **历史兼容格式1** | `["选项A", "", "自定义文本"]` | 空字符串 `""` 作为"other"哨兵值，仅用于读取兼容 |
-| **历史兼容格式2** | `["选项A", "other", "自定义文本"]` | 使用 `"other"` 作为哨兵值，仅用于读取兼容 |
-| **历史兼容格式3** | `["选项A", "自定义文本"]` | 无哨兵值，仅用于读取兼容 |
+##### 历史兼容读取格式（三种，仅读取不写入）
 
-> **关键修正**：写回时统一使用**无哨兵**格式，空字符串等哨兵值**仅用于读取时的向后兼容**，不会被写入。
+**文件**: `multiple-choice-multi-element.tsx:94-144`
+
+| 格式类型 | 示例 | 检测方式 | 说明 |
+|---------|------|---------|------|
+| **格式1：空字符串哨兵** | `["产品A", "", "自定义文本"]` | `value.includes("")` | 注释标记为"Current"，但实际代码不写入 |
+| **格式2：other ID 哨兵** | `["产品A", "other", "自定义文本"]` | `value.includes(otherOption.id)` | 历史格式，仅读取 |
+| **格式3：无哨兵** | `["产品A", "自定义文本"]` | 检测未知值（不是已知标签也不是已知ID） | 与现行写入格式一致 |
+
+**读取 other 值的提取逻辑**：
+```typescript
+// 格式1：["", "<custom>"] → 取哨兵后一位
+const sentinelIndex = value.indexOf("");
+if (sentinelIndex !== -1) {
+  setOtherValue(value[sentinelIndex + 1] ?? "");
+}
+
+// 格式2：["other", "<custom>"] → 取 other ID 后一位
+const otherIdIndex = value.indexOf(otherOption.id);
+if (otherIdIndex !== -1) {
+  setOtherValue(value[otherIdIndex + 1] ?? "");
+}
+
+// 格式3：["<custom>"] → 取第一个未知值
+const unknown = value.find((v) => v !== "" && !knownLabels.has(v) && !knownIds.has(v));
+setOtherValue(unknown ?? "");
+```
+
+##### 逻辑评估时的统一转换
+
+**文件**: `logic.ts:124-140`
+
+三种格式在逻辑评估时都会被统一转换为 choice ID 数组（含 `"other"` 标记）：
+
+```typescript
+// 遍历存储值（无论哪种格式）
+responseValue.forEach((value) => {
+  const foundChoice = currentQuestion.choices.find((choice) => {
+    return getLocalizedValue(choice.label, selectedLanguage) === value;
+  });
+
+  if (foundChoice) {
+    choices.push(foundChoice.id);  // 匹配标签 → choice ID
+  } else if (isOthersEnabled) {
+    choices.push("other");  // 不匹配（空字符串/other ID/自定义文本）→ "other"
+  }
+});
+
+// 去重后返回：["choice_abc123", "other"]
+return Array.from(new Set(choices));
+```
+
+> **关键统一口径**：
+> - ✅ 写入：始终无哨兵，`["标签1", "标签2", "自定义文本"]`
+> - ✅ 读取：兼容3种格式（空字符串哨兵、other ID 哨兵、无哨兵）
+> - ✅ 逻辑评估：统一转换为 choice ID 数组，`"other"` 作为特殊标记
+> - ❌ 现行代码**不写入**空字符串哨兵，注释与代码存在不一致，以实际代码为准
 
 ### 4.3 答案写回流程
 
@@ -440,7 +492,7 @@ export const validateElementResponse = (
 - **CTA 元素**：即使 required=true 也不阻止跳转（仅作信息展示）
 - **Ranking**：required 表示至少 1 项被排名
 - **Matrix**：required 表示至少 1 行被回答
-- **MultipleChoiceMulti**：如选中 "other"（哨兵值 `""`），要求 "其他"文本非空
+- **MultipleChoiceMulti**：如选中 "other"，要求 "其他"文本非空（`otherValue.trim() !== ""`），与哨兵格式无关
 
 #### 4.4.3 传统HTML校验（兼容层）
 
@@ -1374,11 +1426,13 @@ evaluateLogic() 从 TResponseData 取值
 | 项目 | 内容 |
 |------|------|
 | **错误描述** | 仅提到用空字符串 `""` 作为哨兵值 |
-| **正确事实** | 支持 3 种存储格式（向后兼容）： |
-| | 1. **当前格式**：`["选项A", "", "自定义文本"]` - 空字符串哨兵 |
-| | 2. **历史格式1**：`["选项A", "other", "自定义文本"]` - "other" 哨兵 |
-| | 3. **历史格式2**：`["选项A", "自定义文本"]` - 无哨兵 |
-| | 逻辑评估时统一转换为 `["choiceId1", "choiceId2", "other"]` |
+| **正确事实** | 统一口径： |
+| | ✅ **现行写入**：始终无哨兵，`["选项A", "自定义文本"]` |
+| | ✅ **历史兼容读取**：支持3种格式（仅读取不写入） |
+| | &nbsp;&nbsp;&nbsp;1. 空字符串哨兵：`["选项A", "", "自定义文本"]` |
+| | &nbsp;&nbsp;&nbsp;2. other ID 哨兵：`["选项A", "other", "自定义文本"]` |
+| | &nbsp;&nbsp;&nbsp;3. 无哨兵：`["选项A", "自定义文本"]`（与现行写入一致） |
+| | ✅ **逻辑评估**：统一转换为 `["choiceId1", "choiceId2", "other"]` |
 | **代码证据** | 读取检测：`multiple-choice-multi-element.tsx:94-113` |
 | | 逻辑转换：`logic.ts:107-141` |
 
@@ -1445,3 +1499,67 @@ evaluateLogic() 从 TResponseData 取值
 | | 4. 逻辑成立 → 动态设置 required → 影响下一个 block |
 | | 5. 回退时恢复原始 required 状态 |
 | **代码证据** | 见文档 5.8 节完整示例 |
+
+---
+
+## 九、交叉校验清单：数据形态描述 ↔ 代码证据
+
+本节列出文档中所有"数据形态描述"与对应代码证据的一一映射，确保全文前后一致，无自相矛盾。
+
+### 9.1 答案存储格式类
+
+| 序号 | 数据形态描述 | 代码证据 | 文档位置 |
+|------|-------------|---------|---------|
+| 1 | 单选题存储**标签文本**，不是选项 ID | `multiple-choice-single-element.tsx:99-100` <br> `const foundChoice = allOptions.find((opt) => opt.id === selectedId);` <br> `onChange({ [element.id]: getLocalizedValue(foundChoice.label, languageCode) });` | 4.2 节映射表 |
+| 2 | 多选题存储**标签文本数组**，不是选项 ID | `multiple-choice-multi-element.tsx:222-226` <br> `selectedIds.forEach((id) => {` <br> `  if (id === otherOption?.id) return;` <br> `  const matchingOption = allOptions.find((opt) => opt.id === id);` <br> `  if (matchingOption) nextLabels.push(matchingOption.label);` <br> `});` | 4.2 节映射表 |
+| 3 | 多选 other **现行写入无哨兵**，直接追加自定义文本 | `multiple-choice-multi-element.tsx:168-175` <br> `const nextValue = [...baseLabels, newOtherValue];` <br> `onChange({ [element.id]: nextValue });` <br><br> `multiple-choice-multi-element.tsx:228-231` <br> `if (isOtherNowSelected) {` <br> `  nextLabels.push(otherValue);` <br> `}` | 4.2.4 节 |
+| 4 | 多选 other **历史兼容读取3种格式** | `multiple-choice-multi-element.tsx:94-113`（isOtherSelected） <br> `multiple-choice-multi-element.tsx:116-144`（useEffect 提取 other 值） | 4.2.4 节 |
+| 5 | 多选 other 逻辑评估时**统一转换为 choice ID 数组**，含 `"other"` 标记 | `logic.ts:124-140` <br> `responseValue.forEach((value) => {` <br> `  const foundChoice = currentQuestion.choices.find(...);` <br> `  if (foundChoice) choices.push(foundChoice.id);` <br> `  else if (isOthersEnabled) choices.push("other");` <br> `});` | 4.2.4 节 |
+| 6 | Matrix 存储 **rowLabel → columnLabel**，不是 ID | `matrix-element.tsx:130-140` <br> `const handleRowChange = (rowLabel, columnLabel) => {` <br> `  setValue((prev) => ({ ...prev, [rowLabel]: columnLabel }));` <br> `};` | 4.2 节映射表 |
+
+### 9.2 逻辑配置与运行时类
+
+| 序号 | 数据形态描述 | 代码证据 | 文档位置 |
+|------|-------------|---------|---------|
+| 7 | 逻辑配置层**存 choice ID**，确保标签修改后逻辑不失效 | `apps/web/modules/survey/editor/lib/utils.tsx:1502-1554` <br> `findOptionUsedInLogic(survey, elementId, optionId)` <br> 用 `optionId` 匹配 `condition.rightOperand.value` | 5.7 节 |
+| 8 | 运行时**标签 → ID 映射**，用于逻辑比较 | `logic.ts:107-141` <br> 单选：`getLocalizedValue(choice.label, selectedLanguage) === responseValue` → `choice.id` <br> 多选：遍历数组，标签匹配 → choice ID，不匹配 → `"other"` | 5.3 节、5.7 节 |
+| 9 | 日期题**Date 对象比较**，不是字符串比较 | `logic.ts:264-270`（equals） <br> `new Date(leftValue).getTime() === new Date(rightValue).getTime()` <br><br> `logic.ts:309-315`（isAfter） <br> `new Date(String(leftValue)) > new Date(String(rightValue))` | 5.3.4 节 |
+| 10 | 矩阵题**meta.row 行索引**，返回**列索引字符串** | `logic.ts:148-169` <br> `const rowIndex = Number(leftOperand.meta.row);` <br> `const rowLabel = getLocalizedValue(currentQuestion.rows[rowIndex].label, selectedLanguage);` <br> `const columnIndex = currentQuestion.columns.findIndex(...);` <br> `return columnIndex.toString();` | 5.3.3 节 |
+
+### 9.3 required 状态管理类
+
+| 序号 | 数据形态描述 | 代码证据 | 文档位置 |
+|------|-------------|---------|---------|
+| 11 | `originalQuestionRequiredStates` 保存**原始静态配置** | `survey.tsx:208-214` <br> `useMemo(() => questions.reduce((acc, q) => {` <br> `  acc[q.id] = q.required;` <br> `  return acc;` <br> `}, {}), [survey.blocks]);` | 5.6.1 节 |
+| 12 | `questionRequiredByMap` 记录**哪个 block 逻辑导致哪些题必填** | `survey.tsx:217` <br> `useRef<Record<string, string[]>>({});` <br><br> `survey.tsx:789-791` <br> `questionRequiredByMap.current[currentBlock.elements[0].id] = requiredIds;` | 5.6.1 节 |
+| 13 | 前进路径：**先验证后设置 required**，影响下一个 block | `block-conditional.tsx:310-349`（先 validateBlockResponses） <br> `survey.tsx:631-648`（makeQuestionsRequired 修改 state） <br> `survey.tsx:796`（handleRequiredQuestions 在 evaluateLogic 之后调用） | 5.6 节 |
+| 14 | 回退路径：**恢复 originalQuestionRequiredStates**，不是简单设为 false | `survey.tsx:650-677` <br> `revertElementIfNeeded(element) {` <br> `  return { ...element, required: originalQuestionRequiredStates[element.id] ?? element.required };` <br> `}` | 5.6.1 节 |
+| 15 | 回退时**清理 questionRequiredByMap** 记录 | `survey.tsx:675` <br> `delete questionRequiredByMap.current[questionId];` | 5.6.1 节 |
+
+### 9.4 操作符与枚举类
+
+| 序号 | 数据形态描述 | 代码证据 | 文档位置 |
+|------|-------------|---------|---------|
+| 16 | 题型枚举共 **17 种** | `packages/types/surveys/constants.ts:3-19` <br> `FileUpload`, `OpenText`, `MultipleChoiceSingle`, `MultipleChoiceMulti`, <br> `NPS`, `CTA`, `Rating`, `Consent`, `PictureSelection`, `Cal`, <br> `Date`, `Matrix`, `Address`, `Ranking`, `ContactInfo`, `CSAT`, `CES` | 2.3 节 |
+| 17 | 逻辑条件操作符共 **32 种** | `packages/types/surveys/logic.ts:5-37` <br> `equals`, `doesNotEqual`, `contains`, `doesNotContain`, <br> `startsWith`, `doesNotStartWith`, `endsWith`, `doesNotEndWith`, <br> `isSubmitted`, `isSkipped`, `isGreaterThan`, `isLessThan`, <br> `isGreaterThanOrEqual`, `isLessThanOrEqual`, `equalsOneOf`, `includesAllOf`, <br> `includesOneOf`, `doesNotIncludeOneOf`, `doesNotIncludeAllOf`, `isClicked`, <br> `isNotClicked`, `isAccepted`, `isBefore`, `isAfter`, `isBooked`, <br> `isPartiallySubmitted`, `isCompletelySubmitted`, `isSet`, `isNotSet`, <br> `isEmpty`, `isNotEmpty`, `isAnyOf` | 5.1 节 |
+| 18 | `evaluateLogic` 仅返回 **boolean**，动作由 `performActions` 执行 | `logic.ts:28-48`（evaluateLogic 返回 boolean） <br> `logic.ts:50-82`（performActions 返回 `{ jumpTarget, requiredQuestionIds, calculations }`） | 5.2 节 |
+
+### 9.5 Block Schema 类
+
+| 序号 | 数据形态描述 | 代码证据 | 文档位置 |
+|------|-------------|---------|---------|
+| 19 | Block 无 `type` 字段，有**必填 `name` 字段** | `packages/types/surveys/blocks.ts:124-151` <br> `name: z.string().min(1, { error: "Block name is required" })` | 2.4 节 |
+| 20 | Block `id` 是 **CUID 格式** | `packages/types/surveys/blocks.ts:125` <br> `id: ZSurveyBlockId`（ZSurveyBlockId 是 cuid2 格式） | 2.4 节 |
+| 21 | Block `elements` 至少需要 **1 个元素** | `packages/types/surveys/blocks.ts:131-133` <br> `elements: ZSurveyElements.min(1, { error: "Block must have at least one element" })` | 2.4 节 |
+| 22 | Block 内 element ID **必须唯一** | `packages/types/surveys/blocks.ts:138-150` <br> `superRefine((block, ctx) => {` <br> `  const uniqueElementIds = new Set(elementIds);` <br> `  if (uniqueElementIds.size !== elementIds.length) { /* add issue */ }` <br> `})` | 2.4 节 |
+
+### 9.6 一致性校验说明
+
+| 校验项 | 状态 |
+|--------|------|
+| 多选 other 写入格式全文一致 | ✅ 统一为"无哨兵，直接追加" |
+| 多选 other 读取格式全文一致 | ✅ 统一为"3种历史兼容" |
+| 单选/多选存储类型全文一致 | ✅ 统一为"标签文本，不是 ID" |
+| 动态 required 生效时机全文一致 | ✅ 统一为"影响下一个 block" |
+| 逻辑操作符数量全文一致 | ✅ 统一为 32 种 |
+| Block Schema 字段全文一致 | ✅ 无 type，有 name，至少 1 个 element |
