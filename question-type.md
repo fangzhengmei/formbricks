@@ -278,26 +278,35 @@ export const ZResponse = z.object({
 
 ### 4.2 各题型答案值映射表
 
-| 题型 | 值类型 | 示例值 | 说明 |
-|------|--------|--------|------|
-| **OpenText** | `string` | `"hello"` | 直接文本内容 |
-| **MultipleChoiceSingle** | `string` | `"是"` | **存储的是选项标签文本(label)，不是选项ID**；`""` 表示选中"其他"但未填写 |
-| **MultipleChoiceMulti** | `string[]` | `["选项A", "选项B", "其他自定义文本"]` | **存储的是选中的选项标签文本数组，不是ID**；"other" 选项直接追加自定义文本，**没有空字符串哨兵** |
-| **NPS** | `number` | `9` | 0-10 评分 |
-| **Rating** | `number` | `3` | 1-5/3/4/6/7/10 评分 |
-| **Consent** | `string` | `"accepted"` 或 `""` | `"accepted"` 表示同意 |
-| **CTA** | `string` | `"clicked"` 或 `""` | `"clicked"` 表示点击 |
-| **Date** | `string` | `"2024-01-15"` | ISO格式日期 |
-| **PictureSelection** | `string[]` | `["pic1", "pic2"]` | 选中的图片ID |
-| **FileUpload** | `string[]` | `["https://.../file1.pdf"]` | 上传文件URL数组 |
-| **Matrix** | `Record<string, string>` | `{"满意度": "非常满意", "易用性": "一般"}` | **rowLabel → columnLabel，不是rowId → columnId** |
-| **Address** | `string[]` | `["123 Main St", "", "Beijing", "", "100000", "China"]` | 按 [addressLine1, addressLine2, city, state, zip, country] 顺序 |
-| **Ranking** | `string[]` | `["choice2", "choice1", "choice3"]` | 按排名顺序的选项ID |
-| **ContactInfo** | `string[]` | `["Zhang", "San", "zhang@example.com", "", ""]` | 按 [firstName, lastName, email, phone, company] 顺序 |
-| **CSAT/CES** | `number` | `4` | 1-5 或 1-7 评分 |
-| **Cal** | `string` | `"booked"` 或 `""` | `"booked"` 表示已预约 |
+> **关键区分**：
+> - **运行时写回值**：组件 `onChange` 实际写入 `TResponseData` 的数据形态
+> - **逻辑比较值**：`evaluateLogic` 中 `getLeftOperandValue` 返回的用于逻辑比较的值（可能与写回值不同）
 
-> **修正点**：MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID；Matrix 存储的是 rowLabel → columnLabel；多选 other 写回时**没有空字符串哨兵**，哨兵格式仅用于历史兼容读取，不会被现行代码写入。
+| 题型 | 运行时写回值（类型/示例） | 逻辑比较值（类型/转换规则） | 代码证据 |
+|------|---------------------------|----------------------------|----------|
+| **OpenText** | `string`<br>`"hello"` | 与写回值相同（除 number 类型）<br>`inputType=number` 时转 `number` | `open-text-element.tsx:40-42` <br> `logic.ts:99-105` |
+| **MultipleChoiceSingle** | `string`<br>`"工程师"` | `string`（标签 → choice ID）<br>`"工程师"` → `"choice_def456"` | `multiple-choice-single-element.tsx:94-100` <br> `logic.ts:107-123` |
+| **MultipleChoiceMulti** | `string[]`<br>`["产品A", "产品C"]` | `string[]`（标签数组 → choice ID 数组）<br>`["产品A", "产品C"]` → `["choice_xxx", "other"]` | `multiple-choice-multi-element.tsx:168-175, 217-236` <br> `logic.ts:124-140` |
+| **NPS** | `number`<br>`9` | 与写回值相同 | `nps-element.tsx` |
+| **Rating** | `number`<br>`3` | 与写回值相同 | `rating-element.tsx` |
+| **Consent** | `string`<br>`"accepted"` 或 `""` | 与写回值相同 | `consent-element.tsx` |
+| **CTA** | `string`<br>`"clicked"` 或 `""` | 与写回值相同 | `cta-element.tsx` |
+| **Date** | `string`<br>`"2024-01-15"` | 与写回值相同（Date 对象比较在 `evaluateSingleCondition` 中进行） | `date-element.tsx` <br> `logic.ts:264-270` |
+| **PictureSelection** | `string[]`<br>`["pic1", "pic2"]` | 与写回值相同（图片 ID 数组） | `picture-selection-element.tsx:56-65` |
+| **FileUpload** | `string[]`<br>`["https://.../file1.pdf"]` | 与写回值相同（URL 数组） | `file-upload-element.tsx` |
+| **Matrix** | `Record<string, string>`<br>`{"满意度": "非常满意"}` | `string`（通过 `meta.row` 取特定行 → 列索引字符串）<br>如 `meta.row="0"` → `"2"`（第3列） | `matrix-element.tsx:130-140` <br> `logic.ts:143-170` |
+| **Address** | `string[]`<br>`["123 Main St", "", "Beijing", ...]` | 与写回值相同（固定顺序数组） | `address-element.tsx` |
+| **Ranking** | `string[]`<br>`["产品A", "产品B", "产品C"]` | 与写回值相同（**标签数组，无转换**）<br>⚠️ 注意：逻辑层不做 ID 转换，直接用标签比较 | `ranking-element.tsx:96-103` <br> `logic.ts` 无特殊处理 |
+| **ContactInfo** | `string[]`<br>`["Zhang", "San", "zhang@...", "", ""]` | 与写回值相同（固定顺序数组） | `contact-info-element.tsx` |
+| **CSAT/CES** | `number`<br>`4` | 与写回值相同（使用 RatingElement 渲染） | `element-conditional.tsx:334-349` <br> `rating-element.tsx` |
+| **Cal** | `string`<br>`"booked"` 或 `""` | 与写回值相同 | `cal-element.tsx` |
+
+> **修正点**：
+> 1. MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID
+> 2. Matrix 存储的是 rowLabel → columnLabel，不是 ID
+> 3. 多选 other 写回时**没有空字符串哨兵**，哨兵格式仅用于历史兼容读取
+> 4. **Ranking 存储的是标签文本数组**，不是选项 ID（之前描述错误，已修正）
+> 5. 新增"运行时写回值"与"逻辑比较值"的区分列
 
 #### 多选 "other" 存储格式详解
 
@@ -1185,7 +1194,7 @@ if (currentQuestion.type === "multipleChoiceSingle" || currentQuestion.type === 
 - 选项：`[{ id: "choice_xxx", label: "产品A" }, { id: "choice_yyy", label: "产品B" }, { id: "other", label: "其他" }]`
 - 逻辑：如果 q2 包含 "产品A"（choice ID: `"choice_xxx"`）或 "产品B"（choice ID: `"choice_yyy"`），则 q3 设为必填
 
-**完整链路**：
+**完整链路（区分运行时写回值 vs 逻辑比较值）**：
 
 ```
 1. 【配置时】编辑器保存逻辑条件
@@ -1202,7 +1211,7 @@ if (currentQuestion.type === "multipleChoiceSingle" || currentQuestion.type === 
    onChange({ q2: ["产品A", "产品C"] })
    ↓
    responseData = { q2: ["产品A", "产品C"] }
-   ↑ 存的是标签文本数组，无哨兵
+   ↑ 【运行时写回值】标签文本数组，无哨兵
 
 3. 【提交时】用户点击 Next
    ↓
@@ -1219,6 +1228,7 @@ if (currentQuestion.type === "multipleChoiceSingle" || currentQuestion.type === 
          "产品A" → 找到 id = "choice_xxx"
          "产品C" → 未匹配标签，启用了 other → 返回 "other"
        return ["choice_xxx", "other"]
+       ↑ 【逻辑比较值】choice ID 数组
      ↓
      evaluateSingleCondition("includesOneOf")
        leftValue = ["choice_xxx", "other"]  (映射后的 ID 数组)
@@ -1500,6 +1510,27 @@ evaluateLogic() 从 TResponseData 取值
 | | 5. 回退时恢复原始 required 状态 |
 | **代码证据** | 见文档 5.8 节完整示例 |
 
+### 8.12 Ranking 题存储形态描述错误
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | Ranking 题存储选项 ID 数组，示例：`["choice2", "choice1", "choice3"]` |
+| **正确事实** | Ranking 题存储**标签文本数组**，不是选项 ID，示例：`["产品A", "产品B", "产品C"]`（按排名顺序） |
+| | 与单选/多选写回逻辑一致（`handleChange` 中 id → label），但逻辑评估时不一致（无 ID 映射） |
+| **代码证据** | 写回：`ranking-element.tsx:96-103` <br> `nextLabels.push(matchingOption.label);` <br> 逻辑评估：`logic.ts` 无特殊处理，直接返回 `data[leftOperand.value]`（标签数组） |
+
+### 8.13 未区分运行时写回值与逻辑比较值
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 未明确区分组件实际写入 `TResponseData` 的值与 `evaluateLogic` 中用于比较的值 |
+| **正确事实** | 新增完整区分： |
+| | **运行时写回值**：组件 `onChange` 实际写入的数据形态（如单选存储标签） |
+| | **逻辑比较值**：`getLeftOperandValue` 返回的用于比较的值（如单选转成 choice ID） |
+| | 需要转换的题型：OpenText(number)、MultipleChoiceSingle、MultipleChoiceMulti、Matrix（共 4 种） |
+| | 不需要转换的题型：其余 12 种直接使用写回值 |
+| **代码证据** | 转换逻辑：`logic.ts:99-170` <br> 全表对照：第 10 章最终一致性清单 |
+
 ---
 
 ## 九、交叉校验清单：数据形态描述 ↔ 代码证据
@@ -1516,6 +1547,7 @@ evaluateLogic() 从 TResponseData 取值
 | 4 | 多选 other **历史兼容读取3种格式** | `multiple-choice-multi-element.tsx:94-113`（isOtherSelected） <br> `multiple-choice-multi-element.tsx:116-144`（useEffect 提取 other 值） | 4.2.4 节 |
 | 5 | 多选 other 逻辑评估时**统一转换为 choice ID 数组**，含 `"other"` 标记 | `logic.ts:124-140` <br> `responseValue.forEach((value) => {` <br> `  const foundChoice = currentQuestion.choices.find(...);` <br> `  if (foundChoice) choices.push(foundChoice.id);` <br> `  else if (isOthersEnabled) choices.push("other");` <br> `});` | 4.2.4 节 |
 | 6 | Matrix 存储 **rowLabel → columnLabel**，不是 ID | `matrix-element.tsx:130-140` <br> `const handleRowChange = (rowLabel, columnLabel) => {` <br> `  setValue((prev) => ({ ...prev, [rowLabel]: columnLabel }));` <br> `};` | 4.2 节映射表 |
+| 7 | **Ranking 存储标签文本数组**，不是选项 ID | `ranking-element.tsx:96-103` <br> `selectedIds.forEach((id) => {` <br> `  const matchingOption = options.find((opt) => opt.id === id);` <br> `  if (matchingOption) nextLabels.push(matchingOption.label);` <br> `});` | 4.2 节映射表（已修正） |
 
 ### 9.2 逻辑配置与运行时类
 
@@ -1525,6 +1557,8 @@ evaluateLogic() 从 TResponseData 取值
 | 8 | 运行时**标签 → ID 映射**，用于逻辑比较 | `logic.ts:107-141` <br> 单选：`getLocalizedValue(choice.label, selectedLanguage) === responseValue` → `choice.id` <br> 多选：遍历数组，标签匹配 → choice ID，不匹配 → `"other"` | 5.3 节、5.7 节 |
 | 9 | 日期题**Date 对象比较**，不是字符串比较 | `logic.ts:264-270`（equals） <br> `new Date(leftValue).getTime() === new Date(rightValue).getTime()` <br><br> `logic.ts:309-315`（isAfter） <br> `new Date(String(leftValue)) > new Date(String(rightValue))` | 5.3.4 节 |
 | 10 | 矩阵题**meta.row 行索引**，返回**列索引字符串** | `logic.ts:148-169` <br> `const rowIndex = Number(leftOperand.meta.row);` <br> `const rowLabel = getLocalizedValue(currentQuestion.rows[rowIndex].label, selectedLanguage);` <br> `const columnIndex = currentQuestion.columns.findIndex(...);` <br> `return columnIndex.toString();` | 5.3.3 节 |
+| 11 | **明确区分运行时写回值 vs 逻辑比较值** | 4.2 节映射表新增两列区分 <br> 5.8 节示例链路明确标注 | 4.2 节、5.8 节 |
+| 12 | **Ranking 逻辑评估无 ID 转换**（与单选/多选不一致） | `logic.ts` 中无 ranking 特殊处理 <br> 直接返回 `data[leftOperand.value]`（标签数组） | 10.1 节特殊说明 |
 
 ### 9.3 required 状态管理类
 
@@ -1560,6 +1594,57 @@ evaluateLogic() 从 TResponseData 取值
 | 多选 other 写入格式全文一致 | ✅ 统一为"无哨兵，直接追加" |
 | 多选 other 读取格式全文一致 | ✅ 统一为"3种历史兼容" |
 | 单选/多选存储类型全文一致 | ✅ 统一为"标签文本，不是 ID" |
+| **Ranking 存储类型全文一致** | ✅ 统一为"标签文本数组，不是 ID"（已修正） |
 | 动态 required 生效时机全文一致 | ✅ 统一为"影响下一个 block" |
 | 逻辑操作符数量全文一致 | ✅ 统一为 32 种 |
 | Block Schema 字段全文一致 | ✅ 无 type，有 name，至少 1 个 element |
+| 运行时写回值 vs 逻辑比较值区分 | ✅ 已在 4.2 节映射表和 5.8 节示例链路中明确区分 |
+
+---
+
+## 十、最终一致性清单：全题型写回 & 逻辑评估对照
+
+本节按「题型 → 当前写回数据形态 → 逻辑评估转换形态 → 代码证据」的格式，整理所有题型的完整对照关系，确保全文口径统一。
+
+| 序号 | 题型 | 当前写回数据形态（TResponseData 存储） | 逻辑评估转换形态（getLeftOperandValue 返回） | 代码证据 |
+|------|------|--------------------------------------|------------------------------------------|----------|
+| 1 | **OpenText** | `string`<br>示例：`"用户输入的文本"` | 与写回值相同，除 `inputType=number` 时转 `number`<br>`Number(responseValue)` | 写回：`open-text-element.tsx:40-42`<br>转换：`logic.ts:99-105` |
+| 2 | **MultipleChoiceSingle** | `string`（标签文本）<br>示例：`"工程师"` | `string`（choice ID 或 `"other"`）<br>通过 `getLocalizedValue(choice.label, selectedLanguage) === responseValue` 匹配 → `choice.id` | 写回：`multiple-choice-single-element.tsx:94-100`<br>转换：`logic.ts:107-123` |
+| 3 | **MultipleChoiceMulti** | `string[]`（标签文本数组，无哨兵）<br>示例：`["产品A", "产品C"]` | `string[]`（choice ID 数组，含 `"other"`）<br>遍历每个值，标签匹配 → choice ID，不匹配 → `"other"`<br>去重后返回 | 写回：`multiple-choice-multi-element.tsx:168-175, 217-236`<br>转换：`logic.ts:124-140` |
+| 4 | **NPS** | `number`<br>示例：`9` | 与写回值相同 | 写回：`nps-element.tsx` |
+| 5 | **Rating** | `number`<br>示例：`3` | 与写回值相同 | 写回：`rating-element.tsx` |
+| 6 | **Consent** | `string`<br>示例：`"accepted"` 或 `""` | 与写回值相同 | 写回：`consent-element.tsx` |
+| 7 | **CTA** | `string`<br>示例：`"clicked"` 或 `""` | 与写回值相同 | 写回：`cta-element.tsx` |
+| 8 | **Date** | `string`（ISO 格式）<br>示例：`"2024-01-15"` | 与写回值相同（Date 对象比较在 `evaluateSingleCondition` 中进行）<br>`new Date(leftValue).getTime() === new Date(rightValue).getTime()` | 写回：`date-element.tsx`<br>比较：`logic.ts:264-270` |
+| 9 | **PictureSelection** | `string[]`（图片 ID 数组）<br>示例：`["pic1", "pic2"]` | 与写回值相同 | 写回：`picture-selection-element.tsx:56-65` |
+| 10 | **FileUpload** | `string[]`（URL 数组）<br>示例：`["https://.../file1.pdf"]` | 与写回值相同 | 写回：`file-upload-element.tsx` |
+| 11 | **Matrix** | `Record<string, string>`（rowLabel → columnLabel）<br>示例：`{"满意度": "非常满意"}` | `string`（列索引字符串）<br>通过 `leftOperand.meta.row` 指定行索引 → 取对应行的列标签 → 查找列索引 → 返回 `columnIndex.toString()` | 写回：`matrix-element.tsx:130-140`<br>转换：`logic.ts:143-170` |
+| 12 | **Address** | `string[]`（固定顺序数组）<br>示例：`["123 Main St", "", "Beijing", ...]` | 与写回值相同（固定顺序：[addressLine1, addressLine2, city, state, zip, country]） | 写回：`address-element.tsx` |
+| 13 | **Ranking**（⚠️ 已修正） | `string[]`（标签文本数组，按排名顺序）<br>示例：`["产品A", "产品B", "产品C"]` | 与写回值相同（**逻辑层不做 ID 转换，直接用标签比较**）<br>⚠️ 注意：与单选/多选不同，Ranking 逻辑评估时无 ID 映射 | 写回：`ranking-element.tsx:96-103`<br>转换：`logic.ts` 无特殊处理 |
+| 14 | **ContactInfo** | `string[]`（固定顺序数组）<br>示例：`["Zhang", "San", "zhang@...", "", ""]` | 与写回值相同（固定顺序：[firstName, lastName, email, phone, company]） | 写回：`contact-info-element.tsx` |
+| 15 | **CSAT/CES** | `number`<br>示例：`4` | 与写回值相同（使用 RatingElement 渲染） | 写回：`rating-element.tsx`<br>路由：`element-conditional.tsx:334-349` |
+| 16 | **Cal** | `string`<br>示例：`"booked"` 或 `""` | 与写回值相同 | 写回：`cal-element.tsx` |
+
+### 10.1 特殊说明
+
+1. **需要逻辑转换的题型（4 种）**：
+   - OpenText (number)：字符串 → 数字
+   - MultipleChoiceSingle：标签 → choice ID
+   - MultipleChoiceMulti：标签数组 → choice ID 数组（含 "other"）
+   - Matrix：rowLabel → columnLabel → 列索引字符串
+
+2. **不需要逻辑转换的题型（12 种）**：
+   - 直接使用写回值进行逻辑比较
+
+3. **Ranking 特殊处理**：
+   - 运行时写回：标签数组（与单选/多选一致的设计模式）
+   - 逻辑评估：直接用标签比较（与单选/多选不同，无 ID 映射）
+   - 代码不一致点：`logic.ts` 中未对 Ranking 做特殊转换，可能是遗漏
+
+4. **多选 other 特殊处理**：
+   - 写入：始终无哨兵，`["标签1", "标签2", "自定义文本"]`
+   - 读取：兼容 3 种历史格式（空字符串哨兵、other ID 哨兵、无哨兵）
+   - 逻辑评估：统一转换为 `["choiceId1", "other"]`
+
+5. **element-conditional 回显辅助函数**：
+   - `getResponseValueForRankingElement(value, choices)`：回显时标签 → ID，仅用于组件渲染，不影响数据存储和逻辑评估
