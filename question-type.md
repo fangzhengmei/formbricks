@@ -282,7 +282,7 @@ export const ZResponse = z.object({
 |------|--------|--------|------|
 | **OpenText** | `string` | `"hello"` | 直接文本内容 |
 | **MultipleChoiceSingle** | `string` | `"是"` | **存储的是选项标签文本(label)，不是选项ID**；`""` 表示选中"其他"但未填写 |
-| **MultipleChoiceMulti** | `string[]` | `["选项A", "选项B", "", "其他自定义文本"]` | **存储的是选中的选项标签文本数组，不是ID**；`""` 是"other"的哨兵值，下一个元素为用户输入的自定义文本 |
+| **MultipleChoiceMulti** | `string[]` | `["选项A", "选项B", "其他自定义文本"]` | **存储的是选中的选项标签文本数组，不是ID**；"other" 选项直接追加自定义文本，**没有空字符串哨兵** |
 | **NPS** | `number` | `9` | 0-10 评分 |
 | **Rating** | `number` | `3` | 1-5/3/4/6/7/10 评分 |
 | **Consent** | `string` | `"accepted"` 或 `""` | `"accepted"` 表示同意 |
@@ -297,19 +297,52 @@ export const ZResponse = z.object({
 | **CSAT/CES** | `number` | `4` | 1-5 或 1-7 评分 |
 | **Cal** | `string` | `"booked"` 或 `""` | `"booked"` 表示已预约 |
 
-> **修正点**：MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID；Matrix 存储的是 rowLabel → columnLabel。
+> **修正点**：MultipleChoiceSingle/MultipleChoiceMulti 存储的是**标签文本**，不是选项 ID；Matrix 存储的是 rowLabel → columnLabel；多选 other 写回时**没有空字符串哨兵**，哨兵仅用于兼容读取。
 
 #### 多选 "other" 存储格式详解
 
-**文件**: `multiple-choice-multi-element.tsx:94-144`
+**文件**: `multiple-choice-multi-element.tsx:168-175, 217-236`
+
+##### 实际写回格式（当前）
+
+```typescript
+// handleMultiSelectChange: 用户选择/取消选择时
+const handleMultiSelectChange = (selectedIds: string[]) => {
+  const nextLabels: string[] = [];
+  const isOtherNowSelected = Boolean(otherOption) && selectedIds.includes(otherOption!.id);
+
+  selectedIds.forEach((id) => {
+    if (id === otherOption?.id) return;  // 跳过 other ID
+    const matchingOption = allOptions.find((opt) => opt.id === id);
+    if (matchingOption) nextLabels.push(matchingOption.label);  // 存标签
+  });
+
+  if (isOtherNowSelected) {
+    nextLabels.push(otherValue);  // 直接追加自定义文本，无哨兵
+  }
+
+  onChange({ [element.id]: nextLabels });
+};
+
+// handleOtherValueChange: 用户在"其他"输入框输入时
+const handleOtherValueChange = (newOtherValue: string) => {
+  setOtherValue(newOtherValue);
+  const baseLabels = getNormalizedSelectedLabels();
+  const nextValue = [...baseLabels, newOtherValue];  // 直接追加，无哨兵
+  onChange({ [element.id]: nextValue });
+};
+```
+
+##### 读取时兼容的历史格式
 
 | 格式类型 | 示例 | 说明 |
 |---------|------|------|
-| **当前格式** | `["选项A", "", "自定义文本"]` | 空字符串 `""` 作为"other"哨兵值，紧跟自定义文本 |
-| **历史兼容格式1** | `["选项A", "other", "自定义文本"]` | 使用 `"other"` 作为哨兵值 |
-| **历史兼容格式2** | `["选项A", "自定义文本"]` | 无哨兵值，直接存储自定义文本 |
+| **当前写回格式** | `["选项A", "选项B", "自定义文本"]` | 直接追加自定义文本，无哨兵 |
+| **历史兼容格式1** | `["选项A", "", "自定义文本"]` | 空字符串 `""` 作为"other"哨兵值，仅用于读取兼容 |
+| **历史兼容格式2** | `["选项A", "other", "自定义文本"]` | 使用 `"other"` 作为哨兵值，仅用于读取兼容 |
+| **历史兼容格式3** | `["选项A", "自定义文本"]` | 无哨兵值，仅用于读取兼容 |
 
-> 向后兼容：组件读取时支持上述 3 种格式；写入时统一使用当前格式（空字符串哨兵）。
+> **关键修正**：写回时统一使用**无哨兵**格式，空字符串等哨兵值**仅用于读取时的向后兼容**，不会被写入。
 
 ### 4.3 答案写回流程
 
@@ -832,7 +865,343 @@ const handleBlockSubmit = (e?: Event) => {
 };
 ```
 
-### 5.7 Survey 层逻辑整合
+### 5.6.1 前进与回退路径的 required 状态变化
+
+> **新增内容**：动态 required 有完整的前进设置与回退恢复机制，涉及三个核心变量的联动。
+
+#### 三个核心数据结构
+
+| 变量 | 类型 | 初始化时机 | 作用 |
+|------|------|-----------|------|
+| `originalQuestionRequiredStates` | `Record<string, boolean>` | 组件初始化时，基于 `survey.blocks` 计算 | 保存所有题目的**原始 required 状态**（静态配置值），用于回退时恢复 |
+| `questionRequiredByMap` | `useRef<Record<string, string[]>>` | 初始化为空对象 `{}` | 记录**哪个 block 的逻辑导致了哪些题被设为必填**，key 是 block 第一个 element.id，value 是被设为必填的 element.id 数组 |
+| `localSurvey` state | 包含 `blocks: TSurveyBlock[]` | 初始化为 `survey` prop | 运行时的 survey 状态，`element.required` 可能被动态修改 |
+
+**文件**: `survey.tsx:208-217`
+
+```typescript
+// 保存原始 required 状态（基于 survey.blocks，即静态配置）
+const originalQuestionRequiredStates = useMemo(() => {
+  return questions.reduce<Record<string, boolean>>((acc, question) => {
+    acc[question.id] = question.required;
+    return acc;
+  }, {});
+}, [survey.blocks]);  // 仅依赖原始 survey prop
+
+// 记录逻辑 → required 变更的映射
+const questionRequiredByMap = useRef<Record<string, string[]>>({});
+```
+
+#### 前进路径（Next 按钮）- 设置 required
+
+**文件**: `survey.tsx:786-796`
+
+```typescript
+// 前进时：在 evaluateLogicAndGetNextBlockId 中调用
+const handleRequiredQuestions = (requiredIds: string[]) => {
+  if (requiredIds.length > 0) {
+    // 记录：当前 block 的第一个 element.id → 被设为必填的题目列表
+    if (currentBlock.elements[0]) {
+      questionRequiredByMap.current[currentBlock.elements[0].id] = requiredIds;
+    }
+    // 修改 localSurvey state：将这些题的 required 设为 true
+    makeQuestionsRequired(requiredIds);
+  }
+};
+```
+
+#### 回退路径（Back 按钮）- 恢复 required
+
+**文件**: `survey.tsx:1007-1030`
+
+```typescript
+const onBack = (): void => {
+  isNavigatingBackRef.current = true;
+
+  // 从 history 获取前一个 block ID
+  let prevBlockId: string | undefined;
+  if (history.length > 0) {
+    const newHistory = [...history];
+    prevBlockId = newHistory.pop();
+    setHistory(newHistory);
+  } else {
+    prevBlockId = localSurvey.blocks[currentBlockIndex - 1]?.id;
+  }
+
+  popVariableState();
+
+  // 关键：回退时恢复 required 状态
+  const prevBlock = localSurvey.blocks.find((b) => b.id === prevBlockId);
+  if (prevBlock?.elements[0]) {
+    // 用前一个 block 的第一个 element.id 作为 key，查找哪些题需要恢复
+    revertRequiredChangesByQuestion(prevBlock.elements[0].id);
+  }
+
+  setBlockId(prevBlockId);
+};
+```
+
+#### revertRequiredChangesByQuestion 实现
+
+**文件**: `survey.tsx:650-677`
+
+```typescript
+const revertRequiredChangesByQuestion = (questionId: string): void => {
+  // 从 map 中获取由该 question 所在 block 逻辑导致的必填题列表
+  const questionsToRevert = questionRequiredByMap.current[questionId] || [];
+
+  if (questionsToRevert.length > 0) {
+    const revertElementIfNeeded = (element: TSurveyElement) => {
+      if (questionsToRevert.includes(element.id)) {
+        return {
+          ...element,
+          // 恢复为原始 required 状态，而不是简单设为 false
+          required: originalQuestionRequiredStates[element.id] ?? element.required,
+        };
+      }
+      return element;
+    };
+
+    const updateBlockElements = (block: TSurveyBlock) => ({
+      ...block,
+      elements: block.elements.map(revertElementIfNeeded),
+    });
+
+    setlocalSurvey((prevSurvey) => ({
+      ...prevSurvey,
+      blocks: prevSurvey.blocks.map(updateBlockElements),
+    }));
+
+    // 清理 map，避免重复恢复
+    delete questionRequiredByMap.current[questionId];
+  }
+};
+```
+
+#### 完整时序对比
+
+| 阶段 | 前进路径（Next） | 回退路径（Back） |
+|------|-----------------|-----------------|
+| **触发点** | 用户点击 Next 按钮 | 用户点击 Back 按钮 |
+| **第一步** | 验证当前 block（用原始 required） | `isNavigatingBackRef.current = true` |
+| **第二步** | 验证通过 → 提交答案 | 从 history 栈弹出 prevBlockId |
+| **第三步** | 评估逻辑 → 收集 requiredQuestionIds | `popVariableState()` 恢复变量 |
+| **第四步** | `questionRequiredByMap.current[currentBlockFirstElementId] = requiredIds` | `revertRequiredChangesByQuestion(prevBlockFirstElementId)` |
+| **第五步** | `makeQuestionsRequired(requiredIds)` 修改 state | 恢复 `element.required = originalQuestionRequiredStates[id]` |
+| **第六步** | 跳转到下一个 block | `delete questionRequiredByMap.current[questionId]` |
+| **第七步** | 下一个 block 验证时使用修改后的 required | 跳转到前一个 block |
+
+### 5.7 逻辑配置值与响应存储值的映射契约
+
+> **新增内容**：为什么配置校验看 choice ID，运行时要把标签映射回 ID？
+
+#### 两层不同的存储体系
+
+| 层级 | 存储内容 | 数据类型 | 原因 |
+|------|---------|---------|------|
+| **逻辑配置层**（编辑器） | choice ID | 如 `"choice_abc123"` | ID 是稳定的，标签可被用户修改，用 ID 确保逻辑引用不失效 |
+| **响应存储层**（运行时） | 标签文本 | 如 `"是"` | 标签是用户可见的最终值，便于数据分析和导出，不需要依赖 schema |
+
+#### 配置时用 ID 校验
+
+**文件**: `apps/web/modules/survey/editor/lib/utils.tsx:1502-1554`
+
+```typescript
+// 检查某个选项是否在逻辑中被使用（配置时）
+export const findOptionUsedInLogic = (
+  survey: TSurvey,
+  elementId: string,
+  optionId: string,  // 传入的是 choice ID
+  checkInLeftOperand: boolean = false
+): number => {
+  const isUsedInOperand = (condition: TSingleCondition): boolean => {
+    if (condition.leftOperand.type === "element" && condition.leftOperand.value === elementId) {
+      if (!checkInLeftOperand && condition.rightOperand && condition.rightOperand.type === "static") {
+        if (Array.isArray(condition.rightOperand.value)) {
+          // 用 choice ID 进行匹配
+          return condition.rightOperand.value.includes(optionId);
+        } else {
+          return condition.rightOperand.value === optionId;
+        }
+      }
+    }
+    return false;
+  };
+  // ...
+};
+```
+
+**使用场景**：删除选项时检查是否在逻辑中使用 → 用 ID 匹配
+
+#### 运行时标签 → ID 映射
+
+**文件**: `packages/surveys/src/lib/logic.ts:107-141`
+
+```typescript
+// 左操作数取值转换（运行时）
+if (currentQuestion.type === "multipleChoiceSingle" || currentQuestion.type === "multipleChoiceMulti") {
+  const isOthersEnabled = currentQuestion.choices.some((c) => c.id === "other");
+
+  if (typeof responseValue === "string") {
+    // responseValue 是存储的标签文本，如 "是"
+    // 通过标签查找对应的 choice ID
+    const choice = currentQuestion.choices.find((choice) => {
+      return getLocalizedValue(choice.label, selectedLanguage) === responseValue;
+    });
+
+    if (!choice) {
+      if (isOthersEnabled) {
+        return "other";
+      }
+      return undefined;
+    }
+
+    // 返回 choice ID，用于和逻辑配置中的 ID 比较
+    return choice.id;
+  }
+}
+```
+
+#### 为什么需要这样的映射契约？
+
+| 问题 | 解答 |
+|------|------|
+| **配置时为什么存 ID？** | 标签可修改（如多语言切换、编辑时重命名），ID 是 CUID 永不变化。如果存标签，修改标签后逻辑会失效。 |
+| **运行时为什么存标签？** | 响应数据需要独立可读，便于导出、分析。如果存 ID，没有 schema 上下文无法理解数据含义。 |
+| **为什么运行时要映射回 ID？** | 逻辑配置存的是 ID，运行时必须把标签转成 ID 才能正确比较 `equals` / `includesOneOf` 等操作。 |
+| **多语言场景如何处理？** | 映射时使用 `getLocalizedValue(choice.label, selectedLanguage)` 按当前语言匹配。 |
+
+### 5.8 完整示例链路
+
+#### 5.8.1 单选题完整示例链路
+
+**场景**：
+- 题目："您的职业是？"（elementId: `"q1"`）
+- 选项：`[{ id: "choice_abc123", label: "学生" }, { id: "choice_def456", label: "工程师" }, { id: "other", label: "其他" }]`
+- 逻辑：如果 q1 等于 "工程师"（choice ID: `"choice_def456"`），则跳转到 Block B
+
+**完整链路**：
+
+```
+1. 【配置时】编辑器保存逻辑条件
+   rightOperand: { type: "static", value: "choice_def456" }
+   ↑ 存的是 choice ID
+
+2. 【运行时】用户选择 "工程师"
+   ↓
+   MultipleChoiceSingleElement.handleChange("choice_def456")
+   ↓ 第99-100行：ID → 标签
+   onChange({ q1: "工程师" })
+   ↓
+   responseData = { q1: "工程师" }
+   ↑ 存的是标签文本
+
+3. 【提交时】用户点击 Next
+   ↓
+   validateBlockResponses() → 验证通过
+   ↓
+   evaluateLogicAndGetNextBlockId()
+   ↓
+   evaluateLogic()
+     ↓
+     getLeftOperandValue("q1")
+       ↓ 第107-124行：标签 → ID
+       responseValue = "工程师"
+       查找 choice.label === "工程师" → 找到 id = "choice_def456"
+       return "choice_def456"
+     ↓
+     evaluateSingleCondition("equals")
+       leftValue = "choice_def456"  (映射后的 ID)
+       rightValue = "choice_def456" (逻辑配置的 ID)
+       → true
+     ↓
+   performActions()
+     jumpTarget = "block_b"
+     ↓
+   跳转到 Block B
+```
+
+**文件索引**：
+- 写回：`multiple-choice-single-element.tsx:94-100`
+- 映射：`logic.ts:107-124`
+- 比较：`logic.ts:260-294`
+
+#### 5.8.2 多选题完整示例链路
+
+**场景**：
+- 题目："您使用过以下哪些产品？"（elementId: `"q2"`）
+- 选项：`[{ id: "choice_xxx", label: "产品A" }, { id: "choice_yyy", label: "产品B" }, { id: "other", label: "其他" }]`
+- 逻辑：如果 q2 包含 "产品A"（choice ID: `"choice_xxx"`）或 "产品B"（choice ID: `"choice_yyy"`），则 q3 设为必填
+
+**完整链路**：
+
+```
+1. 【配置时】编辑器保存逻辑条件
+   rightOperand: { type: "static", value: ["choice_xxx", "choice_yyy"] }
+   ↑ 存的是 choice ID 数组
+
+2. 【运行时】用户选择 "产品A" 和 "其他"，输入 "产品C"
+   ↓
+   MultipleChoiceMultiElement.handleMultiSelectChange([ "choice_xxx", "other" ])
+   ↓ 第218-235行：ID → 标签
+   跳过 "other" ID
+   nextLabels = ["产品A"]
+   isOtherNowSelected = true → 追加 otherValue("产品C")
+   onChange({ q2: ["产品A", "产品C"] })
+   ↓
+   responseData = { q2: ["产品A", "产品C"] }
+   ↑ 存的是标签文本数组，无哨兵
+
+3. 【提交时】用户点击 Next
+   ↓
+   validateBlockResponses() → 验证通过
+   ↓
+   evaluateLogicAndGetNextBlockId()
+   ↓
+   evaluateLogic()
+     ↓
+     getLeftOperandValue("q2")
+       ↓ 第124-141行：标签数组 → ID 数组
+       responseValue = ["产品A", "产品C"]
+       遍历：
+         "产品A" → 找到 id = "choice_xxx"
+         "产品C" → 未匹配标签，启用了 other → 返回 "other"
+       return ["choice_xxx", "other"]
+     ↓
+     evaluateSingleCondition("includesOneOf")
+       leftValue = ["choice_xxx", "other"]  (映射后的 ID 数组)
+       rightValue = ["choice_xxx", "choice_yyy"] (逻辑配置的 ID 数组)
+       → true（包含 "choice_xxx"）
+     ↓
+   performActions()
+     requiredQuestionIds = ["q3"]
+     ↓
+   questionRequiredByMap.current[currentBlockFirstElementId] = ["q3"]
+   makeQuestionsRequired(["q3"])
+   ↓
+   跳转到下一个 block，q3.required 已变为 true
+
+4. 【回退时】用户点击 Back
+   ↓
+   onBack()
+     ↓
+     revertRequiredChangesByQuestion(prevBlockFirstElementId)
+       questionsToRevert = ["q3"]
+       q3.required = originalQuestionRequiredStates["q3"] → 恢复原始值
+       delete questionRequiredByMap.current[prevBlockFirstElementId]
+     ↓
+   回到上一个 block，q3.required 已恢复
+```
+
+**文件索引**：
+- 写回：`multiple-choice-multi-element.tsx:218-235`
+- 兼容读取：`multiple-choice-multi-element.tsx:94-113`
+- 映射：`logic.ts:124-141`
+- 比较：`logic.ts:391-396`
+- 前进设置：`survey.tsx:786-796`
+- 回退恢复：`survey.tsx:650-677, 1007-1030`
+
+### 5.9 Survey 层逻辑整合
 
 **文件**: `survey.tsx:697-805`
 
@@ -966,10 +1335,11 @@ evaluateLogic() 从 TResponseData 取值
 | **正确事实** | 单选和多选答案存储的都是**标签文本(label)**，不是选项 ID |
 | | 单选：`{ [elementId]: "选项A的标签文本" }` |
 | | 多选：`{ [elementId]: ["选项A标签", "选项B标签", ...] }` |
-| | 多选 "other" 用空字符串 `""` 作为哨兵值，格式为 `["", "用户输入的自定义文本"]` |
+| | 多选 "other" 写回时**直接追加自定义文本，无空字符串哨兵**；空字符串哨兵仅用于读取兼容 |
 | **代码证据** | 单选写回：`multiple-choice-single-element.tsx:94-100` |
-| | 多选写回：`multiple-choice-multi-element.tsx:217-236` |
+| | 多选写回：`multiple-choice-multi-element.tsx:168-175, 217-236` |
 | | 逻辑评估时转换：`logic.ts:107-141` |
+| | 兼容读取：`multiple-choice-multi-element.tsx:94-113` |
 
 ### 8.3 逻辑条件操作符数量错误
 
@@ -1037,11 +1407,41 @@ evaluateLogic() 从 TResponseData 取值
 
 | 项目 | 内容 |
 |------|------|
-| **错误描述** | 未清晰说明动态 required 如何传递到验证流程 |
-| **正确事实** | 完整衔接流程： |
-| | 1. **当前 block 提交前**：`block-conditional.tsx:316` 调用 `validateBlockResponses(block.elements, value, languageCode)`，使用**原始的** `block.elements`（动态 required 未设置） |
-| | 2. **当前 block 提交后**：`survey.tsx:697-796` 调用 `evaluateLogicAndGetNextBlockId` → 评估逻辑 → 执行动作 → 收集 `requiredQuestionIds` → 调用 `makeQuestionsRequired(requiredIds)` 修改 `localSurvey` state |
-| | 3. **下一个 block 提交时**：使用**修改后的** `element.required` 进行验证 |
-| **代码证据** | 验证调用：`block-conditional.tsx:316` |
-| | state 修改：`survey.tsx:631-648` |
-| | 完整流程：`survey.tsx:697-796` |
+| **错误描述** | 未清晰说明动态 required 如何传递到验证流程，以及回退路径的状态恢复 |
+| **正确事实** | 完整衔接流程涉及三个核心数据结构的联动： |
+| | 1. `originalQuestionRequiredStates`（useMemo）- 保存原始静态配置的 required 状态 |
+| | 2. `questionRequiredByMap`（useRef）- 记录哪个 block 逻辑导致哪些题被设为必填 |
+| | 3. `localSurvey` state - 运行时状态，element.required 可能被动态修改 |
+| | **前进路径**：evaluateLogic → performActions → handleRequiredQuestions → makeQuestionsRequired（修改 state） |
+| | **回退路径**：onBack → revertRequiredChangesByQuestion（恢复 originalQuestionRequiredStates[id]）→ delete map entry |
+| | 动态 required 影响的是**下一个 block** 的验证，不是当前 block |
+| **代码证据** | 核心数据结构：`survey.tsx:208-217` |
+| | 前进设置：`survey.tsx:631-648, 786-796` |
+| | 回退恢复：`survey.tsx:650-677, 1007-1030` |
+| | 先验证后提交：`block-conditional.tsx:310-349` |
+
+### 8.10 逻辑配置值与响应存储值的映射契约缺失
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 未说明为什么配置校验看 choice ID、运行时要把标签映射回 ID |
+| **正确事实** | 两层不同的存储体系： |
+| | **逻辑配置层（编辑器）**：存 choice ID（稳定，标签可修改，确保逻辑引用不失效） |
+| | **响应存储层（运行时）**：存标签文本（独立可读，便于分析导出，不依赖 schema） |
+| | **运行时映射原因**：逻辑配置存 ID，运行时必须把标签转成 ID 才能正确比较 |
+| | **多语言处理**：映射时使用 `getLocalizedValue(choice.label, selectedLanguage)` 按当前语言匹配 |
+| **代码证据** | 配置校验：`apps/web/modules/survey/editor/lib/utils.tsx:1502-1554` |
+| | 运行时映射：`packages/surveys/src/lib/logic.ts:107-141` |
+
+### 8.11 完整示例链路缺失
+
+| 项目 | 内容 |
+|------|------|
+| **错误描述** | 未提供从配置到运行时的完整端到端示例 |
+| **正确事实** | 补充了单选题和多选题各一条完整示例链路，包括： |
+| | 1. 配置时保存 choice ID 到逻辑条件 |
+| | 2. 运行时用户选择 → 组件 ID→标签转换 → 存储标签 |
+| | 3. 提交时标签→ID 映射 → 与逻辑配置 ID 比较 |
+| | 4. 逻辑成立 → 动态设置 required → 影响下一个 block |
+| | 5. 回退时恢复原始 required 状态 |
+| **代码证据** | 见文档 5.8 节完整示例 |
