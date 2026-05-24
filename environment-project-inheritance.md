@@ -304,15 +304,15 @@ filteredSurveys = filteredSurveys.filter((survey) => {
 let filteredSurveys = surveys.filter((survey: TWorkspaceStateSurvey) => {
   switch (survey.displayOption) {  // ⚠️ 直接读 survey 字段，无回退
     case "respondMultiple":
-      return true;
+      return true;  // 无条件显示
     case "displayOnce":
-      return displays.filter(d => d.surveyId === survey.id).length === 0;
+      return displays.filter(d => d.surveyId === survey.id).length === 0;  // 从未显示过
     case "displayMultiple":
-      return responses.filter(id => id === survey.id).length === 0;
+      return responses.filter(id => id === survey.id).length === 0;  // 未响应过（显示次数不限）
     case "displaySome":
-      if (survey.displayLimit === null) return true;
-      if (responses.filter(id => id === survey.id).length) return false;
-      return displays.filter(d => d.surveyId === survey.id).length < survey.displayLimit;
+      if (survey.displayLimit === null) return true;  // ⚠️ 等同于 respondMultiple！
+      if (responses.filter(id => id === survey.id).length) return false;  // 已响应 → 不显示
+      return displays.filter(d => d.surveyId === survey.id).length < survey.displayLimit;  // 未响应且显示次数 < limit
     default:
       throw Error("Invalid displayOption");
   }
@@ -323,7 +323,29 @@ let filteredSurveys = surveys.filter((survey: TWorkspaceStateSurvey) => {
 - `displayOption` 和 `displayLimit` **仅存在于 Survey 模型**，Workspace 没有对应字段
 - 没有任何回退或继承逻辑，每个 Survey 独立配置
 - `displayOption` 有默认值 `displayOnce`（Prisma schema 中定义）
-- `displayLimit` 可为 `null`，此时 `displaySome` 等同于 `displayMultiple`
+- `displayLimit` 可为 `null`，此时 `displaySome` **等同于 `respondMultiple`**（无条件显示，即使已响应过）
+
+---
+
+### 3.5.1 displaySome 三种场景行为差异
+
+| `displaySome` 场景 | 检查条件 | 返回值 | 等同于 |
+|-------------------|---------|-------|--------|
+| `displayLimit === null` | 无检查，直接返回 | `true` | `respondMultiple` |
+| 已响应（在 responses 中） | `responses.length > 0` | `false` | `displayMultiple`（已响应过） |
+| 未响应且 `displayLimit !== null` | `displays.length < displayLimit` | `true`/`false` | 介于 `displayMultiple` 和 `displayOnce` 之间 |
+
+---
+
+### 3.5.2 四种 displayOption 对比
+
+| displayOption | 检查 responses | 检查 displays | 逻辑等价于 |
+|--------------|---------------|--------------|------------|
+| `respondMultiple` | ❌ 不检查 | ❌ 不检查 | 无条件显示 |
+| `displayOnce` | ❌ 不检查 | ✅ `=== 0` | 从未显示过 |
+| `displayMultiple` | ✅ `=== 0`（未响应过） | ❌ 不检查 | 未响应过时可显示无限次 |
+| `displaySome` (limit=null) | ❌ 不检查 | ❌ 不检查 | **respondMultiple**（无条件显示） |
+| `displaySome` (limit≠null) | ✅ `=== 0`（未响应过） | ✅ `< limit` | 未响应过时最多显示 limit 次 |
 
 ---
 
@@ -548,12 +570,13 @@ if (rawData.data.workspace && !rawData.data.settings) {
 | `legacyEnvironmentId` 与其他 `id` 冲突 | `findFirst` 由数据库执行计划决定返回 | `resolve-client-id.ts:14-19` |
 | `workspaceOverwrites.placement = false` | 不会回退到 Workspace（`??` 只判 null/undefined） | `widget.ts:108` |
 | `survey.recontactDays = 0` | 优先使用 0（不限制），不会回退到 Workspace | `utils.ts:119-121` |
-| `survey.displayLimit = null` | `displaySome` 等同于 `displayMultiple`（无次数限制） | `utils.ts:92-94` |
+| `survey.displayLimit = null` | `displaySome` **等同于 `respondMultiple`**（无条件显示，即使已响应过） | `utils.ts:92-94` |
 | `allowStyleOverwrite = false` | `overwriteThemeStyling = true` 也无效，强制使用 Workspace 样式 | `utils.ts:155-166` |
 | 运行时传入未在白名单的 hiddenField | 打 error 日志并默默丢弃 | `utils.ts:284-298` |
 | 首次 setup 网络失败 | 进入 10 分钟错误状态，期间不重试 | `setup.ts:363-385` |
 | Debug 模式激活 | 忽略错误状态，跳过过期检查 | `setup.ts:113-119` |
-| `displaySome` 且已有 response | 不再显示，即使 displayLimit 未达 | `utils.ts:97-99` |
+| `displaySome` 且已有 response | 不再显示，即使 displayLimit 未达 | `utils.ts:96-99` |
+| `displaySome` + `displayLimit=0` | `0 < 0` 为 false，即使未响应也不显示 | `utils.ts:102` |
 
 ---
 
@@ -593,7 +616,8 @@ if (rawData.data.workspace && !rawData.data.settings) {
 | `respondMultiple` | 总是显示（只要未被 segment 过滤） |
 | `displayOnce` | 该 survey 的 displays 计数 === 0 |
 | `displayMultiple` | 该 survey 不在 responses 列表中 |
-| `displaySome` | 不在 responses 中 且 displays 计数 < displayLimit |
+| `displaySome` (displayLimit = null) | **总是显示**（等同于 `respondMultiple`） |
+| `displaySome` (displayLimit ≠ null) | 不在 responses 中 且 displays 计数 < displayLimit |
 
 ---
 
@@ -632,3 +656,5 @@ if (rawData.data.workspace && !rawData.data.settings) {
 | "config.update() 是增量更新" | ❌ 浅合并，未传的顶层字段会丢失 | `config.ts:23-34` |
 | "Workspace 级有 displayLimit" | ❌ 仅 Survey 有 | `js.ts:58-65` |
 | "`??` 会把 false 当作空值回退" | ❌ `??` 只对 `null`/`undefined` 回退，`false` 是有效值 | `widget.ts:105-108` |
+| "`displaySome` + `displayLimit=null` 等同于 `displayMultiple`" | ❌ 等同于 `respondMultiple`（无条件显示，即使已响应） | `utils.ts:92-94` |
+| "`displaySome` 达到 displayLimit 后再响应也能继续显示" | ❌ 先检查 responses，已响应直接返回 false，不看 displayLimit | `utils.ts:96-99` |
