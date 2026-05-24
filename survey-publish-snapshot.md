@@ -453,14 +453,56 @@ model Survey {
 
 这意味着：**"草稿不更新 updatedAt" 在现有数据模型下是不可能的**，必须通过新增字段来实现版本边界的清晰化。
 
-##### 4.3.4.2 修正后的版本边界判断代码（无索引越界）
+##### 4.3.4.2 边界点语义与统一判定准则（必读）
 
-基于代码分析，以下是在业务层实现版本边界判断的**可执行、无 Bug** 代码示例：
+**核心矛盾澄清**：边界点代表版本的**起点**，不是终点。
+
+> **统一判定准则**：
+> 1. 每个 `VersionBoundary.timestamp` 是一个**新版本的起点**
+> 2. 版本区间采用**左闭右开**原则：`[start, end)`，即包含起点，不包含终点
+> 3. 边界按时间**倒序**排列（从新到旧）：`[T_newest, ..., T_oldest]`
+> 4. 第 `i` 个边界点 `T_i` 对应的版本区间是：`[T_i, T_{i-1})`
+> 5. 首段（最新版本）无上界：`[T_0, ∞)`
+> 6. 末段（最早版本）无早于最早边界点的下界：`[T_last, T_{last-1})`
+> 7. "发布前"区间是可选的：`[surveyCreatedAt, T_last)`，不属于任何版本段
+
+**时间轴图示**：
+```
+时间轴正序：
+ T0(创建)    T1(首次发布)    T2(修改问题3)    T3(新增问题5)     现在
+    │            │                │                │              ▶
+    ├────────────┼────────────────┼────────────────┤─────────────▶
+    │  [T0,T1)   │   [T1,T2)      │   [T2,T3)      │  [T3, ∞)
+    │  发布前     │   版本1(末段)  │  版本2(中段)   │  版本3(首段)
+
+边界倒序排列：sortedBoundaries = [T3, T2, T1]
+versionIndex:          0   1   2
+```
+
+**三类时间区间的统一公式**：
+
+给定边界倒序排列 `B = [B0, B1, B2]`（B0最新，B2最早）：
+
+| 类型 | versionIndex | 左边界（min） | 右边界（max） | 区间公式 |
+|------|-------------|--------------|--------------|----------|
+| **首段** | `0` | `B0.timestamp` | 无 | `createdAt >= B0` |
+| **中段** | `1` | `B1.timestamp` | `B0.timestamp - 1ms` | `createdAt >= B1 AND createdAt < B0` |
+| **末段** | `2` | `B2.timestamp` | `B1.timestamp - 1ms` | `createdAt >= B2 AND createdAt < B1` |
+| **发布前（可选）** | - | `surveyCreatedAt` | `B2.timestamp - 1ms` | `createdAt >= surveyCreatedAt AND createdAt < B2` |
+
+**关键验证**：
+- 每个边界点 `Bi` 都是版本 `i` 的起点
+- 每个版本区间都包含其起点 `Bi`
+- 右边界 `-1ms` 是为了实现左闭右开 `[start, end)`
+- 3个边界点 → 恰好3个版本段，没有遗漏
+
+##### 4.3.4.3 修正后的版本边界判断代码（语义一致）
 
 ```typescript
 /**
  * 人为约定的版本边界判断
  * 注意：这不是 Formbricks 内置的逻辑，需要业务层自行实现
+ * 统一语义：每个边界点代表一个版本的起点（左闭右开区间 [start, end)）
  */
 interface VersionBoundary {
   timestamp: Date;
@@ -471,7 +513,7 @@ interface VersionBoundary {
 /**
  * 版本类型定义
  */
-type VersionSegmentType = 'first' | 'middle' | 'last';
+type VersionSegmentType = 'first' | 'middle' | 'last' | 'pre-release';
 
 /**
  * 版本区间信息
@@ -485,11 +527,11 @@ interface VersionSegment {
 
 /**
  * 修正后的版本过滤条件生成函数
- * 修复了原示例中末段索引越界的问题
+ * 统一语义：边界点 = 版本起点，左闭右开区间
  * 
  * @param boundaries 人为记录的版本边界列表（需要自己维护）
  * @param versionIndex 要查询的版本索引（0 = 最新版本 = 首段）
- * @param surveyCreatedAt 问卷创建时间（可选，用于末段下界）
+ * @param surveyCreatedAt 问卷创建时间（可选，用于"发布前"区间）
  * @returns 该版本的响应过滤条件，以及版本类型信息
  */
 function getVersionFilterCriteria(
@@ -507,6 +549,25 @@ function getVersionFilterCriteria(
     };
   }
 
+  // 特殊处理：versionIndex = -1 表示查询"发布前"区间
+  if (versionIndex === -1) {
+    if (!surveyCreatedAt) {
+      throw new Error('查询发布前区间必须提供 surveyCreatedAt');
+    }
+    const oldestBoundary = boundaries[boundaries.length - 1];
+    return {
+      type: 'pre-release',
+      versionIndex: -1,
+      description: '发布前',
+      filterCriteria: {
+        createdAt: {
+          min: surveyCreatedAt,
+          max: new Date(oldestBoundary.timestamp.getTime() - 1)
+        }
+      }
+    };
+  }
+
   // 边界检查：索引越界
   if (versionIndex < 0 || versionIndex >= boundaries.length) {
     throw new Error(`versionIndex ${versionIndex} out of bounds (0-${boundaries.length - 1})`);
@@ -515,8 +576,8 @@ function getVersionFilterCriteria(
   // 按时间倒序排列（从新到旧）
   const sortedBoundaries = [...boundaries].sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
 
-  const currentVersion = sortedBoundaries[versionIndex];
-  const nextVersion = sortedBoundaries[versionIndex + 1];  // 注意：是下一个（更旧的）版本
+  const currentBoundary = sortedBoundaries[versionIndex];  // 当前版本的起点
+  const previousBoundary = sortedBoundaries[versionIndex - 1];  // 上一个（更新的）边界，即当前版本的终点
 
   // 判断版本类型
   const isFirstSegment = versionIndex === 0;                    // 首段：最新版本
@@ -528,118 +589,117 @@ function getVersionFilterCriteria(
   if (isFirstSegment) {
     // ════════════════════════════════════════════════════════════
     // 首段（最新版本）：>= 当前边界时间戳，无上界
+    // 区间：[B0, ∞)
     // ════════════════════════════════════════════════════════════
     // 时间轴： ──┼───────────────────────────▶
-    //      T3(当前)       响应属于此版本
+    //      B0(当前)       响应属于此版本
     filterCriteria = {
-      createdAt: { min: currentVersion.timestamp }
+      createdAt: { min: currentBoundary.timestamp }
     };
   } else if (isMiddleSegment) {
     // ════════════════════════════════════════════════════════════
-    // 中段（历史版本）：>= 下一个边界 AND < 当前边界
+    // 中段（历史版本）：>= 当前边界 AND < 上一个边界
+    // 区间：[B1, B0) 左闭右开
     // ════════════════════════════════════════════════════════════
     // 时间轴： ──┼───────────────────────────┼──────▶
-    //      T2(下一个)   响应属于此版本    T3(当前)
+    //      B1(当前)   响应属于此版本    B0(上一个)
     filterCriteria = {
       createdAt: {
-        min: nextVersion!.timestamp,  // 中段一定有下一个版本，非空
-        max: new Date(currentVersion.timestamp.getTime() - 1)  // 闭区间：不包含当前边界
+        min: currentBoundary.timestamp,  // 当前版本起点，包含
+        max: new Date(previousBoundary.timestamp.getTime() - 1)  // 上一个版本起点，不包含
       }
     };
   } else {
     // ════════════════════════════════════════════════════════════
-    // 末段（最早版本）：< 当前边界，可选 >= 问卷创建时间
+    // 末段（最早版本）：>= 当前边界 AND < 上一个边界
+    // 区间：[B2, B1) 左闭右开
     // ════════════════════════════════════════════════════════════
-    // 时间轴： ──┬──────────────────┼──────▶
-    //     问卷创建   响应属于此版本  T1(当前)
+    // 时间轴： ──┼───────────────────────────┼──────▶
+    //      B2(当前)   响应属于此版本    B1(上一个)
     filterCriteria = {
       createdAt: {
-        max: new Date(currentVersion.timestamp.getTime() - 1)  // 闭区间：不包含当前边界
+        min: currentBoundary.timestamp,  // 当前版本起点，包含
+        max: new Date(previousBoundary.timestamp.getTime() - 1)  // 上一个版本起点，不包含
       }
     };
-    // 如果提供了问卷创建时间，加上下界
-    if (surveyCreatedAt) {
-      filterCriteria.createdAt!.min = surveyCreatedAt;
-    }
+    // 注意：末段也有上一个边界（B1），不需要使用 surveyCreatedAt
+    // surveyCreatedAt 仅用于"发布前"区间（versionIndex = -1）
   }
 
   return {
     type: isFirstSegment ? 'first' : isLastSegment ? 'last' : 'middle',
     versionIndex,
-    description: currentVersion.description,
+    description: currentBoundary.description,
     filterCriteria
   };
 }
 ```
 
-##### 4.3.4.3 三类时间区间的执行判定方法
-
-| 版本类型 | 索引位置 | 时间区间条件 | 边界检查 |
-|---------|---------|-------------|---------|
-| **首段（最新）** | `versionIndex === 0` | `createdAt >= currentVersion.timestamp` | 无需检查 `nextVersion`，无上界 |
-| **中段（历史）** | `0 < versionIndex < length-1` | `createdAt >= nextVersion.timestamp AND createdAt < currentVersion.timestamp` | `nextVersion` 非空，两边都有边界 |
-| **末段（最早）** | `versionIndex === length-1` | `createdAt < currentVersion.timestamp` (可选 `>= surveyCreatedAt`) | `nextVersion` 为 `undefined`，下界可选 |
-
-**判定执行流程：**
-```
-输入: boundaries, versionIndex, surveyCreatedAt?
-    ↓
-1. 检查 boundaries 是否为空 → 返回空过滤
-    ↓
-2. 检查 versionIndex 是否越界 → 抛出错误
-    ↓
-3. 按时间倒序排序 boundaries
-    ↓
-4. 获取 currentVersion = sorted[versionIndex]
-   获取 nextVersion = sorted[versionIndex + 1]
-    ↓
-5. 判断类型:
-   ├─ 首段: versionIndex === 0 → min = current.timestamp
-   ├─ 中段: 0 < index < length-1 → min = next.timestamp, max = current.timestamp - 1ms
-   └─ 末段: versionIndex === length-1 → max = current.timestamp - 1ms (可选 min = surveyCreatedAt)
-    ↓
-输出: VersionSegment (type + filterCriteria)
-```
-
-##### 4.3.4.4 完整使用示例（无索引越界）
+##### 4.3.4.4 完整使用示例（语义一致）
 
 ```typescript
 /**
  * 使用示例：查询发布后修改前后的响应
+ * 统一语义验证：边界点 = 版本起点，左闭右开 [start, end)
  */
 async function getVersionedResponsesExample() {
   // 1. 你需要自己记录版本边界（Formbricks 不提供这个功能）
   // 注意：只记录发布和有意的内容修改，不记录草稿自动保存
   const myBoundaries: VersionBoundary[] = [
-    { timestamp: new Date('2026-05-20T10:00:00Z'), description: '首次发布', type: 'publish' },
-    { timestamp: new Date('2026-05-22T14:30:00Z'), description: '修改问题3选项', type: 'edit' },
-    { timestamp: new Date('2026-05-24T09:15:00Z'), description: '新增问题5', type: 'edit' },
+    { timestamp: new Date('2026-05-20T10:00:00Z'), description: '首次发布', type: 'publish' },  // T1
+    { timestamp: new Date('2026-05-22T14:30:00Z'), description: '修改问题3选项', type: 'edit' },  // T2
+    { timestamp: new Date('2026-05-24T09:15:00Z'), description: '新增问题5', type: 'edit' },      // T3
   ];
 
-  const surveyCreatedAt = new Date('2026-05-18T08:00:00Z');
+  const surveyCreatedAt = new Date('2026-05-18T08:00:00Z');  // T0
+
+  // 边界倒序排序后：[T3, T2, T1]
+  // versionIndex:              0   1   2
 
   // 2. 查询首段（最新版本：新增问题5之后）
+  // 边界点：T3 (2026-05-24 09:15)
+  // 区间：[T3, ∞) → >= 2026-05-24 09:15
   const latestSegment = getVersionFilterCriteria(myBoundaries, 0, surveyCreatedAt);
   console.log('首段类型:', latestSegment.type);  // 'first'
+  console.log('首段说明:', latestSegment.description);  // '新增问题5'
   console.log('首段过滤:', JSON.stringify(latestSegment.filterCriteria));
   // { createdAt: { min: '2026-05-24T09:15:00.000Z' } }
   const latestResponses = await getResponses('survey_xxx', 100, 0, latestSegment.filterCriteria);
 
   // 3. 查询中段（历史版本：修改问题3之后，新增问题5之前）
+  // 边界点：T2 (2026-05-22 14:30)
+  // 区间：[T2, T3) → >= 2026-05-22 14:30 且 < 2026-05-24 09:15
   const middleSegment = getVersionFilterCriteria(myBoundaries, 1, surveyCreatedAt);
   console.log('中段类型:', middleSegment.type);  // 'middle'
+  console.log('中段说明:', middleSegment.description);  // '修改问题3选项'
   console.log('中段过滤:', JSON.stringify(middleSegment.filterCriteria));
-  // { createdAt: { min: '2026-05-20T10:00:00.000Z', max: '2026-05-24T09:14:59.999Z' } }
+  // { createdAt: { min: '2026-05-22T14:30:00.000Z', max: '2026-05-24T09:14:59.999Z' } }
   const middleResponses = await getResponses('survey_xxx', 100, 0, middleSegment.filterCriteria);
 
-  // 4. 查询末段（最早版本：首次发布之前，问卷创建之后）
+  // 4. 查询末段（最早版本：首次发布之后，修改问题3之前）
+  // 边界点：T1 (2026-05-20 10:00)
+  // 区间：[T1, T2) → >= 2026-05-20 10:00 且 < 2026-05-22 14:30
   const lastSegment = getVersionFilterCriteria(myBoundaries, 2, surveyCreatedAt);
   console.log('末段类型:', lastSegment.type);  // 'last'
+  console.log('末段说明:', lastSegment.description);  // '首次发布'
   console.log('末段过滤:', JSON.stringify(lastSegment.filterCriteria));
-  // { createdAt: { min: '2026-05-18T08:00:00.000Z', max: '2026-05-20T09:59:59.999Z' } }
+  // { createdAt: { min: '2026-05-20T10:00:00.000Z', max: '2026-05-22T14:29:59.999Z' } }
   const lastResponses = await getResponses('survey_xxx', 100, 0, lastSegment.filterCriteria);
 
-  // 5. 边界检查：越界访问会抛出错误
+  // 5. 查询发布前区间（可选：问卷创建之后，首次发布之前）
+  // 区间：[T0, T1) → >= 2026-05-18 08:00 且 < 2026-05-20 10:00
+  try {
+    const preReleaseSegment = getVersionFilterCriteria(myBoundaries, -1, surveyCreatedAt);
+    console.log('发布前类型:', preReleaseSegment.type);  // 'pre-release'
+    console.log('发布前说明:', preReleaseSegment.description);  // '发布前'
+    console.log('发布前过滤:', JSON.stringify(preReleaseSegment.filterCriteria));
+    // { createdAt: { min: '2026-05-18T08:00:00.000Z', max: '2026-05-20T09:59:59.999Z' } }
+    const preReleaseResponses = await getResponses('survey_xxx', 100, 0, preReleaseSegment.filterCriteria);
+  } catch (e) {
+    console.log('发布前查询错误:', (e as Error).message);
+  }
+
+  // 6. 边界检查：越界访问会抛出错误
   try {
     getVersionFilterCriteria(myBoundaries, 3, surveyCreatedAt);
   } catch (e) {
@@ -651,14 +711,31 @@ async function getVersionedResponsesExample() {
 /**
  * 实际调用 getResponses 的示例
  * 对应代码：apps/web/lib/response/service.ts:278
+ * 语义验证：2个边界点产生3个区间
  */
 import { getResponses } from "@/lib/response/service";
 
 async function queryResponsesByDateRange() {
-  // 2026-05-20 10:00 发布了问卷
-  // 2026-05-22 14:30 修改了问题3
+  // 边界：2026-05-20 10:00 发布了问卷（T1）
+  // 边界：2026-05-22 14:30 修改了问题3（T2）
+  // 倒序排序：[T2, T1]
+  // versionIndex: [0, 1]
   
-  // 查询修改前的响应（末段）
+  // 查询首段（versionIndex=0，边界点T2）：修改后的响应
+  // 区间：[T2, ∞) → >= 2026-05-22 14:30
+  const afterEditResponses = await getResponses(
+    'survey_xxx',
+    100,
+    0,
+    {
+      createdAt: {
+        min: new Date('2026-05-22T14:30:00Z')
+      }
+    }
+  );
+  
+  // 查询末段（versionIndex=1，边界点T1）：修改前的响应
+  // 区间：[T1, T2) → >= 2026-05-20 10:00 且 < 2026-05-22 14:30
   const beforeEditResponses = await getResponses(
     'survey_xxx',
     100,
@@ -671,20 +748,29 @@ async function queryResponsesByDateRange() {
     }
   );
   
-  // 查询修改后的响应（首段）
-  const afterEditResponses = await getResponses(
-    'survey_xxx',
-    100,
-    0,
-    {
-      createdAt: {
-        min: new Date('2026-05-22T14:30:00Z')
-      }
-    }
-  );
-  
   return { beforeEditResponses, afterEditResponses };
 }
+
+/**
+ * 语义一致性验证表格
+ * 
+ * 边界列表（正序）：T1(首次发布) → T2(修改问题3) → T3(新增问题5)
+ * 边界列表（倒序）：[T3, T2, T1]
+ * versionIndex:         0   1   2
+ * 
+ * | versionIndex | 边界点 | 类型 | 区间公式 | 实际区间 | 说明 |
+ * |-------------|--------|------|----------|----------|------|
+ * | 0 | T3 | 首段 | [T3, ∞) | >= 2026-05-24 09:15 | 新增问题5之后 |
+ * | 1 | T2 | 中段 | [T2, T3) | >= 2026-05-22 14:30 且 < 2026-05-24 09:15 | 修改问题3之后，新增问题5之前 |
+ * | 2 | T1 | 末段 | [T1, T2) | >= 2026-05-20 10:00 且 < 2026-05-22 14:30 | 首次发布之后，修改问题3之前 |
+ * | -1 | (无) | 发布前 | [T0, T1) | >= 2026-05-18 08:00 且 < 2026-05-20 10:00 | 问卷创建之后，首次发布之前 |
+ * 
+ * 关键验证：
+ * - 3个边界点 → 3个版本段（首段、中段、末段）+ 1个可选发布前段
+ * - 每个边界点 Ti 都是版本 i 的起点（左闭）
+ * - 每个版本 i 的终点是版本 i-1 的起点（右开，减1ms）
+ * - 没有区间重叠，也没有区间遗漏
+ */
 ```
 
 #### 4.3.5 可落地结论
@@ -973,34 +1059,61 @@ while (hasMore) {
 5. **草稿自动保存也推进 updatedAt**：每 10 秒的自动保存会产生大量无效版本边界
 6. **"草稿不更新 updatedAt" 不可行**：受数据层硬约束，必须通过新增字段实现版本边界清晰化
 
-### 8.2 三类时间区间判定方法（可执行）
+### 8.2 三类时间区间判定方法（可执行，语义统一）
 
-| 版本类型 | 索引位置 | 时间区间条件 | 边界检查 |
-|---------|---------|-------------|---------|
-| **首段（最新）** | `versionIndex === 0` | `createdAt >= currentVersion.timestamp` | 无需检查 `nextVersion`，无上界 |
-| **中段（历史）** | `0 < versionIndex < length-1` | `createdAt >= nextVersion.timestamp AND createdAt < currentVersion.timestamp` | `nextVersion` 非空，两边都有边界 |
-| **末段（最早）** | `versionIndex === length-1` | `createdAt < currentVersion.timestamp` (可选 `>= surveyCreatedAt`) | `nextVersion` 为 `undefined`，下界可选 |
+**统一语义：边界点 = 版本起点，左闭右开区间 [start, end)**
 
-**判定执行流程**：
+边界按时间倒序排列：`B = [B0, B1, B2]`（B0最新，B2最早）
+
+| 版本类型 | 索引位置 | 左边界（min） | 右边界（max） | 区间公式 | 边界检查 |
+|---------|---------|--------------|--------------|----------|---------|
+| **首段（最新）** | `versionIndex === 0` | `B0.timestamp` | 无 | `createdAt >= B0` | 无上界，无需获取前一个边界 |
+| **中段（历史）** | `0 < versionIndex < length-1` | `B1.timestamp` | `B0.timestamp - 1ms` | `createdAt >= B1 AND createdAt < B0` | 前一个边界（B0）存在，两边都有界 |
+| **末段（最早）** | `versionIndex === length-1` | `B2.timestamp` | `B1.timestamp - 1ms` | `createdAt >= B2 AND createdAt < B1` | 前一个边界（B1）存在，两边都有界 |
+| **发布前（可选）** | `versionIndex === -1` | `surveyCreatedAt` | `B2.timestamp - 1ms` | `createdAt >= surveyCreatedAt AND createdAt < B2` | 不属于版本段，需单独处理 |
+
+**关键修正**：
+- 中段和末段都使用 `previousBoundary`（前一个更新的边界）作为右边界
+- 变量名从 `nextVersion`（下一个更旧的）改为 `previousBoundary`（上一个更新的），避免语义混淆
+- 末段不再需要 `surveyCreatedAt` 作为下界，因为末段的起点是最早的边界点
+- `surveyCreatedAt` 仅用于可选的"发布前"区间
+
+**判定执行流程（修正版）**：
 ```
 输入: boundaries, versionIndex, surveyCreatedAt?
     ↓
 1. 检查 boundaries 是否为空 → 返回空过滤
     ↓
-2. 检查 versionIndex 是否越界 → 抛出错误
+2. 特殊处理：versionIndex === -1 → 返回"发布前"区间
     ↓
-3. 按时间倒序排序 boundaries
+3. 检查 versionIndex 是否越界（<0 或 >= length） → 抛出错误
     ↓
-4. 获取 currentVersion = sorted[versionIndex]
-   获取 nextVersion = sorted[versionIndex + 1]
+4. 按时间倒序排序 boundaries
     ↓
-5. 判断类型:
-   ├─ 首段: versionIndex === 0 → min = current.timestamp
-   ├─ 中段: 0 < index < length-1 → min = next.timestamp, max = current.timestamp - 1ms
-   └─ 末段: versionIndex === length-1 → max = current.timestamp - 1ms (可选 min = surveyCreatedAt)
+5. 获取 currentBoundary = sorted[versionIndex]   // 当前版本的起点
+   获取 previousBoundary = sorted[versionIndex - 1] // 当前版本的终点（上一个更新的边界）
+    ↓
+6. 判断类型:
+   ├─ 首段: versionIndex === 0
+   │   → min = currentBoundary.timestamp
+   │   → 无 max
+   │
+   ├─ 中段: 0 < versionIndex < length-1
+   │   → min = currentBoundary.timestamp
+   │   → max = previousBoundary.timestamp - 1ms
+   │
+   └─ 末段: versionIndex === length-1
+       → min = currentBoundary.timestamp
+       → max = previousBoundary.timestamp - 1ms
     ↓
 输出: VersionSegment (type + filterCriteria)
 ```
+
+**语义一致性验证**：
+- 3个边界点（B0, B1, B2） → 恰好3个版本段，没有遗漏
+- 每个版本区间都包含其起点（左闭）
+- 每个版本区间都不包含上一个边界（右开）
+- 没有区间重叠，也没有区间遗漏
 
 ### 8.3 发布流程要点
 
