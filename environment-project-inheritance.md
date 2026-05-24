@@ -39,9 +39,24 @@ const effectiveId = configInput.workspaceId ?? configInput.environmentId;
 - 两者都不提供时，返回 `missing_field` 错误
   「代码依据」：`packages/js-core/src/lib/common/setup.ts:137-143`
 
-#### 1.2.2 服务端数据库查询（无严格先后顺序）
+#### 1.2.2 服务端数据库查询（前置 CUID 校验 + OR 查询）
 
-**代码依据**：`apps/web/lib/utils/resolve-client-id.ts:14-19`
+**完整请求处理流程**：`apps/web/app/api/v1/client/[workspaceId]/environment/route.ts:25-57`
+
+```
+1. 类型检查：typeof params.workspaceId !== "string" → 400 Bad Request
+   「代码依据」：`route.ts:27-31`
+
+2. CUID 格式校验：ZId.safeParse(idParam) 失败 → 400 Invalid ID format
+   「代码依据」：`route.ts:36-49`
+   * ZId 定义：z.cuid2() - 仅接受标准 CUID2 格式
+   * 此校验在进入 legacyEnvironmentId 兼容查询之前，格式不合法直接拒绝
+
+3. 仅通过校验后，才调用 resolveClientApiIds(idParam)
+   「代码依据」：`route.ts:52`
+```
+
+**OR 查询实现**：`apps/web/lib/utils/resolve-client-id.ts:14-19`
 ```typescript
 export const findWorkspaceByIdOrLegacyEnvId = async (id: string) => {
   return await prisma.workspace.findFirst({
@@ -52,9 +67,15 @@ export const findWorkspaceByIdOrLegacyEnvId = async (id: string) => {
 ```
 
 **关键结论**：
+- **前置门槛**：必须先通过 `ZId.safeParse`（CUID2 格式），否则不进入兼容查询
 - 使用 `OR` 条件**单次查询**，不是先查一个再查另一个
 - `id` 和 `legacyEnvironmentId` 两个字段都有**唯一索引**，由 PostgreSQL 查询优化器决定使用哪个索引
 - 若存在极端冲突（某个 ID 既是 A 的主键也是 B 的 legacyEnvironmentId），`findFirst` 返回哪条取决于数据库执行计划
+
+**边界条件**：
+- 空字符串 `""`：类型检查通过，但 `trim()` 后 CUID 校验失败 → 400
+- 非 CUID2 格式（如 UUID、随机字符串）：CUID 校验失败 → 400
+- 格式合法但不存在：`resolveClientApiIds` 返回 null → 404
 
 ---
 
@@ -456,18 +477,18 @@ public update(newConfig: TConfigUpdateInput): void {
 2. 已初始化检查：getIsSetup() === true → 直接返回
 
 3. 错误状态检查
-   ├─ status.value === "error" 且 isDebug === false
+   ├─ status.value === "error" 且 isDebug === false（URL 无 `formbricksDebug=true`）
    │   ├─ status.expiresAt 未过期 → 跳过初始化
    │   └─ status.expiresAt 已过期 → 继续
-   └─ isDebug === true → 忽略错误状态，重置配置
+   └─ isDebug === true（URL 含 `formbricksDebug=true`）→ 忽略错误状态，重置配置
 
 4. 现有配置匹配检查
    ├─ existingConfig.workspaceId === effectiveId
    │  && existingConfig.appUrl === configInput.appUrl
    │  && existingConfig.status.value !== "error"
-   │   → 检查过期时间：
-   │     ├─ workspace.expiresAt 过期 → fetchWorkspaceState
-   │     └─ user.expiresAt 过期 → fetch 用户状态
+   │   → 检查过期时间（isDebug === true 时强制跳过过期检查）：
+   │     ├─ workspace.expiresAt 过期 或 isDebug → fetchWorkspaceState
+   │     └─ user.expiresAt 过期 或 isDebug → fetch 用户状态
    └─ 不匹配 → 完整初始化：
         ├─ fetchWorkspaceState（服务端）
         ├─ 默认 userState（无 userId）
@@ -511,7 +532,8 @@ export const putFormbricksInErrorState = (formbricksConfig) => {
 
 **错误状态边界条件**：
 - 错误状态有效期：**10 分钟**
-- Debug 模式（`?fb_debug=true`）下**忽略错误状态**
+- Debug 模式（`?formbricksDebug=true`）下**忽略错误状态**
+  「代码依据」：`packages/js-core/src/lib/common/utils.ts:346`
 - 错误状态下 SDK 完全停止工作，不显示任何调查
 - 过期后自动恢复重试
 
@@ -574,7 +596,7 @@ if (rawData.data.workspace && !rawData.data.settings) {
 | `allowStyleOverwrite = false` | `overwriteThemeStyling = true` 也无效，强制使用 Workspace 样式 | `utils.ts:155-166` |
 | 运行时传入未在白名单的 hiddenField | 打 error 日志并默默丢弃 | `utils.ts:284-298` |
 | 首次 setup 网络失败 | 进入 10 分钟错误状态，期间不重试 | `setup.ts:363-385` |
-| Debug 模式激活 | 忽略错误状态，跳过过期检查 | `setup.ts:113-119` |
+| Debug 模式激活（`?formbricksDebug=true`） | 忽略错误状态，跳过过期检查，请求加 `Cache-Control: no-cache` | `utils.ts:346`、`setup.ts:113-119`、`api.ts:19` |
 | `displaySome` 且已有 response | 不再显示，即使 displayLimit 未达 | `utils.ts:96-99` |
 | `displaySome` + `displayLimit=0` | `0 < 0` 为 false，即使未响应也不显示 | `utils.ts:102` |
 
@@ -582,21 +604,25 @@ if (rawData.data.workspace && !rawData.data.settings) {
 
 ## 七、优先级总览（修正版）
 
-### 7.1 行为配置优先级
+> **重要说明**：不同类型配置有**独立的决策链**，运行时参数（hiddenFields）不参与行为/样式配置的优先级。
+
+### 7.1 行为配置优先级（placement / overlay / clickOutsideClose）
+
+**决策链**：`widget.ts:105-108`，仅使用 Survey 和 Workspace 配置，与运行时参数无关。
 
 ```
 ┌─────────────────────────────────────────────┐
-│  最高：SDK 调用时的 runtime 参数（仅 hiddenFields）│
+│  最高：Survey.workspaceOverwrites.*         │
+│        （非 null/undefined 时生效）         │
 ├─────────────────────────────────────────────┤
-│  第二：Survey.workspaceOverwrites             │
-│        （placement / overlay / clickOutsideClose）│
-├─────────────────────────────────────────────┤
-│  第三：Workspace.settings                     │
-│        （placement / overlay / clickOutsideClose）│
+│  回退：Workspace.settings.*                 │
+│        （workspaceOverwrites 未设置时生效） │
 └─────────────────────────────────────────────┘
 ```
 
-### 7.2 样式配置优先级（双重开关）
+### 7.2 样式配置优先级（双重开关机制）
+
+**决策链**：`utils.ts:150-167`，与运行时参数无关。
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -621,6 +647,32 @@ if (rawData.data.workspace && !rawData.data.settings) {
 
 ---
 
+### 7.4 hiddenFields 独立决策链（运行时参数唯一作用点）
+
+**决策链**：`widget.ts:41-44` → `utils.ts:272-302`，与行为/样式配置完全隔离。
+
+```
+┌───────────────────────────────────────────────────────────┐
+│  hiddenFields 决策链（不影响 placement/overlay/styling）  │
+├───────────────────────────────────────────────────────────┤
+│  1. 前置检查：survey.hiddenFields.enabled === true        │
+│     → false：打 error 日志，返回空对象                    │
+├───────────────────────────────────────────────────────────┤
+│  2. 白名单过滤：仅保留 survey.hiddenFields.fieldIds 中的键 │
+│     → 不在白名单：打 error 日志，默默丢弃                 │
+├───────────────────────────────────────────────────────────┤
+│  3. 运行时参数优先级：运行时传入值覆盖 survey 侧默认值     │
+│     （但仅对通过白名单的字段生效）                        │
+└───────────────────────────────────────────────────────────┘
+```
+
+**关键隔离保证**：
+- `handleHiddenFields` 返回值**仅**用于 `renderWidget` 的 `hiddenFieldsRecord` 参数
+- 行为配置（`widget.ts:105-108`）和样式配置（`utils.ts:150-167`）完全不引用 hiddenFields
+- 运行时参数（`properties.hiddenFields`）不流入任何其他决策函数
+
+---
+
 ## 八、关键代码位置速查表
 
 | 功能模块 | 文件路径 | 行号 |
@@ -636,6 +688,9 @@ if (rawData.data.workspace && !rawData.data.settings) {
 | 样式配置优先级（双重开关） | `packages/js-core/src/lib/common/utils.ts` | 150-167 |
 | recontactDays 优先级 | `packages/js-core/src/lib/common/utils.ts` | 109-131 |
 | displayOption 处理逻辑 | `packages/js-core/src/lib/common/utils.ts` | 81-106 |
+| CUID 格式校验（前置门槛） | `apps/web/app/api/v1/client/[workspaceId]/environment/route.ts` | 36-49 |
+| Debug 参数检测 | `packages/js-core/src/lib/common/utils.ts` | 346 |
+| hiddenFields 独立决策链 | `packages/js-core/src/lib/survey/widget.ts` | 41-44 |
 | 运行时 hiddenFields 白名单过滤 | `packages/js-core/src/lib/common/utils.ts` | 272-302 |
 | Config 合并策略（浅合并+status 特殊处理） | `packages/js-core/src/lib/common/config.ts` | 23-34 |
 | 错误状态处理 | `packages/js-core/src/lib/common/setup.ts` | 363-406 |
@@ -658,3 +713,6 @@ if (rawData.data.workspace && !rawData.data.settings) {
 | "`??` 会把 false 当作空值回退" | ❌ `??` 只对 `null`/`undefined` 回退，`false` 是有效值 | `widget.ts:105-108` |
 | "`displaySome` + `displayLimit=null` 等同于 `displayMultiple`" | ❌ 等同于 `respondMultiple`（无条件显示，即使已响应） | `utils.ts:92-94` |
 | "`displaySome` 达到 displayLimit 后再响应也能继续显示" | ❌ 先检查 responses，已响应直接返回 false，不看 displayLimit | `utils.ts:96-99` |
+| "Debug 参数是 `?fb_debug=true`" | ❌ 实际是 `?formbricksDebug=true` | `utils.ts:346` |
+| "legacyEnvironmentId 兼容查询无格式门槛" | ❌ 先通过 `ZId.safeParse`（CUID2 格式），不合法直接 400 | `route.ts:36-49` |
+| "运行时参数优先级高于 workspaceOverwrites" | ❌ 运行时参数（hiddenFields）是独立决策链，不参与行为配置 | `widget.ts:105-108`、`widget.ts:41-44` |
