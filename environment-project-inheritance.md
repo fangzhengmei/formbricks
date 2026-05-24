@@ -234,7 +234,7 @@ export const getWorkspaceState = async (workspaceId: string) => {
 
 ---
 
-### 3.2 行为配置优先级（placement / overlay / clickOutsideClose）
+### 3.2 行为配置决策链（placement / overlay / clickOutsideClose）
 
 **代码依据**：`packages/js-core/src/lib/survey/widget.ts:105-108`
 
@@ -245,9 +245,9 @@ const overlay = workspaceOverwrites.overlay ?? settings.overlay;
 const placement = workspaceOverwrites.placement ?? settings.placement;
 ```
 
-**优先级（从高到低）**：
-1. `survey.workspaceOverwrites.placement` - 调查级覆盖（若不为 null/undefined）
-2. `settings.placement` - 工作空间全局默认
+**回退顺序（从高到低）**：
+1. `survey.workspaceOverwrites.placement` - 调查级（非 null/undefined 时使用）
+2. `settings.placement` - 工作空间全局（未设置时回退）
 
 **空值判定逻辑**：
 - 使用 `??`（nullish coalescing），仅 `null` / `undefined` 时回退
@@ -255,7 +255,7 @@ const placement = workspaceOverwrites.placement ?? settings.placement;
 
 ---
 
-### 3.3 样式配置优先级（双重开关机制）
+### 3.3 样式配置决策链（双重开关机制）
 
 **代码依据**：`packages/js-core/src/lib/common/utils.ts:150-167`
 
@@ -288,7 +288,7 @@ export const getStyling = (
 
 ---
 
-### 3.4 recontactDays 优先级（两级继承）
+### 3.4 recontactDays 决策链（两级继承）
 
 **代码依据**：`packages/js-core/src/lib/common/utils.ts:109-131`
 
@@ -310,9 +310,9 @@ filteredSurveys = filteredSurveys.filter((survey) => {
 });
 ```
 
-**优先级**：
-1. `survey.recontactDays`（非 null 时）
-2. `settings.recontactDays`（非 0 时）
+**回退顺序**：
+1. `survey.recontactDays`（非 null 时使用）
+2. `settings.recontactDays`（非 0 时回退使用）
 3. 无限制
 
 ---
@@ -405,27 +405,38 @@ export const handleHiddenFields = (
   if (!enabledHiddenFields) {
     logger.error("Hidden fields are not enabled for this survey");
   } else if (surveyHiddenFieldIds && hiddenFields) {
-    // 只保留在 survey.fieldIds 白名单中的字段
+    const unknownHiddenFields: string[] = [];
+    // 遍历运行时传入的 hiddenFields，仅保留白名单内的字段
     hiddenFieldsObject = Object.keys(hiddenFields).reduce((acc, key) => {
       if (surveyHiddenFieldIds.includes(key)) {
-        acc[key] = hiddenFields[key];
+        acc[key] = hiddenFields[key];  // 直接使用运行时值
       } else {
-        // 不在白名单中的字段打 error 日志并丢弃
         unknownHiddenFields.push(key);
       }
       return acc;
     }, {});
+
+    if (unknownHiddenFields.length > 0) {
+      logger.error(
+        `Unknown hidden fields: ${unknownHiddenFields.join(", ")}. Please add them to the survey hidden fields.`
+      );
+    }
   }
 
   return hiddenFieldsObject;
 };
 ```
 
+**关键事实**：
+- 没有 "survey 侧默认值" 的概念，`hiddenFieldsConfig` 只包含 `enabled`（开关）和 `fieldIds`（白名单）
+- 没有 "覆盖" 或 "合并" 流程，最终值**完全来自运行时传入**（经过白名单过滤）
+- 如果运行时未传 `hiddenFields`，即使 `enabled=true`，也返回空对象 `{}`
+
 **运行时参数影响边界**：
-| 可影响 | 不可影响 |
-|--------|----------|
-| ✅ hiddenFields 白名单内的字段值 | ❌ 任何样式配置 |
-| | ❌ 任何行为配置（placement、overlay等） |
+| 可传递（仅 hiddenFields） | 完全不可影响 |
+|--------------------------|--------------|
+| ✅ 白名单内的 hiddenFields 字段值（仅透传，无合并） | ❌ 任何样式配置 |
+| | ❌ 任何行为配置（placement、overlay 等） |
 | | ❌ displayOption、displayLimit |
 | | ❌ recontactDays |
 | | ❌ 调查过滤逻辑 |
@@ -602,25 +613,25 @@ if (rawData.data.workspace && !rawData.data.settings) {
 
 ---
 
-## 七、优先级总览（修正版）
+## 七、配置决策链总览
 
-> **重要说明**：不同类型配置有**独立的决策链**，运行时参数（hiddenFields）不参与行为/样式配置的优先级。
+> **重要说明**：不同类型配置有**完全独立的决策链**，彼此互不干扰。运行时参数（hiddenFields）不参与行为/样式配置决策。
 
-### 7.1 行为配置优先级（placement / overlay / clickOutsideClose）
+### 7.1 行为配置决策链（placement / overlay / clickOutsideClose）
 
 **决策链**：`widget.ts:105-108`，仅使用 Survey 和 Workspace 配置，与运行时参数无关。
 
 ```
 ┌─────────────────────────────────────────────┐
-│  最高：Survey.workspaceOverwrites.*         │
-│        （非 null/undefined 时生效）         │
-├─────────────────────────────────────────────┤
-│  回退：Workspace.settings.*                 │
-│        （workspaceOverwrites 未设置时生效） │
+│  Survey.workspaceOverwrites.*               │
+│    （非 null/undefined 时使用此值）         │
+│        ↓ 否则回退                           │
+│  Workspace.settings.*                       │
+│    （workspaceOverwrites 未设置时使用）     │
 └─────────────────────────────────────────────┘
 ```
 
-### 7.2 样式配置优先级（双重开关机制）
+### 7.2 样式配置决策链（双重开关机制）
 
 **决策链**：`utils.ts:150-167`，与运行时参数无关。
 
@@ -651,20 +662,37 @@ if (rawData.data.workspace && !rawData.data.settings) {
 
 **决策链**：`widget.ts:41-44` → `utils.ts:272-302`，与行为/样式配置完全隔离。
 
+> **重要澄清**：不存在"默认值合并"或"覆盖"流程。`handleHiddenFields` 只做两件事：**开关检查** + **白名单过滤**。
+
 ```
 ┌───────────────────────────────────────────────────────────┐
 │  hiddenFields 决策链（不影响 placement/overlay/styling）  │
 ├───────────────────────────────────────────────────────────┤
-│  1. 前置检查：survey.hiddenFields.enabled === true        │
-│     → false：打 error 日志，返回空对象                    │
-├───────────────────────────────────────────────────────────┤
-│  2. 白名单过滤：仅保留 survey.hiddenFields.fieldIds 中的键 │
-│     → 不在白名单：打 error 日志，默默丢弃                 │
-├───────────────────────────────────────────────────────────┤
-│  3. 运行时参数优先级：运行时传入值覆盖 survey 侧默认值     │
-│     （但仅对通过白名单的字段生效）                        │
+│  输入来源：                                               │
+│    • survey.hiddenFields.enabled     （开关）             │
+│    • survey.hiddenFields.fieldIds    （白名单）           │
+│    • properties.hiddenFields         （运行时传入值）     │
+│                                                           │
+│  1. 初始状态：hiddenFieldsObject = {}                      │
+│                                                           │
+│  2. 开关检查：survey.hiddenFields.enabled === true        │
+│     ├─ false：打 error 日志，返回 {}                      │
+│     └─ true：继续                                          │
+│                                                           │
+│  3. 白名单过滤（仅当 fieldIds 和运行时值同时存在时）：      │
+│     ├─ 遍历运行时传入的 hiddenFields 的 key               │
+│     ├─ 在白名单中 → 保留该键值（完全使用运行时值）          │
+│     └─ 不在白名单 → 打 error 日志，默默丢弃                │
+│                                                           │
+│  4. 返回结果：空对象 或 过滤后的运行时值                   │
 └───────────────────────────────────────────────────────────┘
 ```
+
+**关键事实**：
+- ❌ 没有 "survey 侧默认值" 的概念和存储
+- ❌ 没有 "覆盖" 或 "合并" 流程（无 survey 侧值可被覆盖）
+- ✅ 最终返回值**完全来自运行时传入**（经过白名单过滤）
+- ✅ 如果运行时未传 `hiddenFields`，即使 enabled=true，也返回 `{}`
 
 **关键隔离保证**：
 - `handleHiddenFields` 返回值**仅**用于 `renderWidget` 的 `hiddenFieldsRecord` 参数
@@ -677,16 +705,16 @@ if (rawData.data.workspace && !rawData.data.settings) {
 
 | 功能模块 | 文件路径 | 行号 |
 |---------|---------|------|
-| SDK 端 ID 优先级（workspaceId > environmentId） | `packages/js-core/src/lib/common/setup.ts` | 135 |
+| SDK 端 ID 回退顺序（workspaceId > environmentId） | `packages/js-core/src/lib/common/setup.ts` | 135 |
 | 服务端 ID OR 查询（无严格先后） | `apps/web/lib/utils/resolve-client-id.ts` | 14-19 |
 | 向后兼容输入转换 | `apps/web/app/lib/api/api-backwards-compat.ts` | 17-30 |
 | 向后兼容输出转换 | `apps/web/app/lib/api/api-backwards-compat.ts` | 39-65 |
 | 单次数据库查询 | `apps/web/app/api/v1/client/[workspaceId]/environment/lib/data.ts` | 35-132 |
 | Workspace 级字段（无 displayOption/displayLimit） | `packages/types/js.ts` | 58-65 |
 | Survey 级字段（含 displayOption/displayLimit） | `packages/types/js.ts` | 9-34 |
-| 行为配置优先级 | `packages/js-core/src/lib/survey/widget.ts` | 105-108 |
-| 样式配置优先级（双重开关） | `packages/js-core/src/lib/common/utils.ts` | 150-167 |
-| recontactDays 优先级 | `packages/js-core/src/lib/common/utils.ts` | 109-131 |
+| 行为配置决策链 | `packages/js-core/src/lib/survey/widget.ts` | 105-108 |
+| 样式配置决策链（双重开关） | `packages/js-core/src/lib/common/utils.ts` | 150-167 |
+| recontactDays 决策链 | `packages/js-core/src/lib/common/utils.ts` | 109-131 |
 | displayOption 处理逻辑 | `packages/js-core/src/lib/common/utils.ts` | 81-106 |
 | CUID 格式校验（前置门槛） | `apps/web/app/api/v1/client/[workspaceId]/environment/route.ts` | 36-49 |
 | Debug 参数检测 | `packages/js-core/src/lib/common/utils.ts` | 346 |
