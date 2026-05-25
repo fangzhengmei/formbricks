@@ -827,6 +827,307 @@ await prisma.$transaction(
 | Webhook 补偿 | 通过 Webhook 通知外部系统，由外部系统保证最终一致性 | 微服务架构 |
 | 读取时合并 | 读取 Response 时，动态获取最新的联系人属性覆盖快照 | 读多写少场景 |
 
+### 5. updateAttributes 双事务执行顺序与失败影响详细分析
+
+`updateAttributes` 函数内部存在**三个独立的数据库写操作**，按严格顺序执行，彼此不共享事务。
+
+#### 操作 0：删除被移除的属性（可选，仅 `deleteRemovedAttributes=true` 时执行）
+
+```typescript
+// apps/web/modules/ee/contacts/lib/attributes.ts:221-223
+if (deleteRemovedAttributes) {
+  await deleteAttributes(contactId, currentAttributes, contactAttributesParam, contactAttributeKeys);
+}
+```
+
+```typescript
+// apps/web/modules/ee/contacts/lib/attributes.ts:82-91
+if (attributeKeyIdsToDelete.length > 0) {
+  await prisma.contactAttribute.deleteMany({
+    where: {
+      contactId,
+      attributeKeyId: { in: attributeKeyIdsToDelete },
+    },
+  });
+}
+```
+
+| 属性 | 说明 |
+|-----|------|
+| **执行条件** | `deleteRemovedAttributes=true` 且存在需要删除的属性 |
+| **事务保护** | ❌ 无，独立的 `prisma.contactAttribute.deleteMany` 调用 |
+| **调用方** | `updateContactAttributes`（UI 层，传入 `true`）；`updateUser`（API 层，默认 `false`） |
+| **保护机制** | `DEFAULT_ATTRIBUTES`（email, userId, firstName, lastName）永远不会被删除 |
+
+**失败影响**：删除失败不会影响后续两个事务的执行。如果操作 0 失败但操作 1 成功，会出现"该删的没删，该改的改了"的不一致状态。
+
+#### 操作 1：更新已有属性（Transaction 1）
+
+```typescript
+// apps/web/modules/ee/contacts/lib/attributes.ts:275-300
+if (existingAttributes.length > 0) {
+  await prisma.$transaction(
+    existingAttributes.map(({ attributeKeyId, columns }) =>
+      prisma.contactAttribute.upsert({
+        where: {
+          contactId_attributeKeyId: { contactId, attributeKeyId },
+        },
+        update: { value: columns.value, valueNumber: columns.valueNumber, valueDate: columns.valueDate },
+        create: { contactId, attributeKeyId, value: columns.value, valueNumber: columns.valueNumber, valueDate: columns.valueDate },
+      })
+    )
+  );
+}
+```
+
+| 属性 | 说明 |
+|-----|------|
+| **执行条件** | `existingAttributes.length > 0`（payload 中包含已存在的属性键） |
+| **事务保护** | ✅ `prisma.$transaction` — 所有 upsert 在同一个事务中 |
+| **写入表** | `ContactAttribute`（值表，不涉及键定义） |
+| **约束** | `contactId_attributeKeyId` 唯一索引；若不存在则走 create |
+
+**失败影响**：
+- 事务内任意一个 upsert 失败 → 整个事务回滚 → 所有已有属性的更新被撤销
+- 操作 0（删除）已提交 → 可能已删除某些属性值，但操作 1 回滚了 → 这些属性值丢失
+- 操作 2（创建新属性）不会执行 → 新属性不会被创建
+
+#### 操作 2：创建新属性（Transaction 2）
+
+```typescript
+// apps/web/modules/ee/contacts/lib/attributes.ts:354-374
+await prisma.$transaction(
+  preparedNewAttributes.map(({ key, dataType, columns }) =>
+    prisma.contactAttributeKey.create({
+      data: {
+        key, name: formatSnakeCaseToTitleCase(key), type: "custom", dataType, workspaceId,
+        attributes: { create: { contactId, value: columns.value, valueNumber: columns.valueNumber, valueDate: columns.valueDate } },
+      },
+    })
+  )
+);
+```
+
+| 属性 | 说明 |
+|-----|------|
+| **执行条件** | `validNewAttributes.length > 0` 且未超过 `MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT` 限制 |
+| **事务保护** | ✅ `prisma.$transaction` — 所有 create 在同一个事务中 |
+| **写入表** | `ContactAttributeKey`（键定义表）+ `ContactAttribute`（值表，嵌套创建） |
+| **前置校验** | `isSafeIdentifier()` 检查键名合法性，非法键名被跳过 |
+
+**失败影响**：
+- 事务内任意一个 create 失败 → 整个事务回滚 → 所有新属性键和值被撤销
+- 操作 1（更新已有属性）已提交 → 已有属性的更新已持久化
+- **典型不一致场景**：用户同时更新 firstName（已有属性）和 customScore（新属性）→ firstName 更新成功但 customScore 创建失败 → 部分更新
+
+#### 完整执行顺序与失败场景矩阵
+
+| 顺序 | 操作 | 事务 | 失败后是否继续 | 失败影响 |
+|-----|------|------|--------------|---------|
+| 0 | deleteAttributes（可选） | 无 | ✅ 继续（代码不检查返回值） | 被删除的属性值可能丢失 |
+| 1 | 更新已有属性 | `$transaction` | ❌ 不继续（抛出异常） | 已有属性更新回滚，操作 2 不执行 |
+| 2 | 创建新属性 | `$transaction` | 无后续 | 新属性创建回滚，操作 1 已提交 |
+
+#### 典型故障场景与排查要点
+
+**场景 1：部分属性更新成功，部分失败**
+- **现象**：联系人 `firstName` 已更新，但 `customScore` 新属性未创建
+- **根因**：操作 1 成功提交，操作 2 失败回滚
+- **排查**：检查日志中是否有 `"Created new contact attribute"` 日志（line 349），对比是否有对应的 error 日志
+- **代码行**：`attributes.ts:349` vs `attributes.ts:182-188`（UpdateQueue 的 catch，实际是 updateAttributes 的 catch）
+
+**场景 2：UI 提交表单后属性值丢失**
+- **现象**：通过 UI 删除一个属性值后刷新页面，值仍然存在
+- **根因**：操作 0（deleteAttributes）失败，但代码未检查返回值（始终返回 `{success: true}`）
+- **排查**：检查 `ContactAttribute` 表中 `attributeKeyId` 对应的记录是否仍存在
+- **代码行**：`attributes.ts:221-223` — 无 `await` 返回值检查
+
+**场景 3：类型不匹配导致静默跳过**
+- **现象**：API 发送 `{ age: "twenty" }` 但联系人属性未更新
+- **根因**：`validateAndParseAttributeValue` 类型校验失败，该属性被排除在 `existingAttributes` 之外
+- **排查**：检查 `messages` 数组中是否有 `attribute_type_validation_error` 消息
+- **代码行**：`attributes.ts:241-259`
+
+### 6. sendUpdates / UpdateQueue 网络异常清理与重试边界
+
+#### UpdateQueue 处理流程与清理时机
+
+```typescript
+// packages/js-core/src/lib/user/update-queue.ts:91-196（核心逻辑）
+public async processUpdates(): Promise<void> {
+  // ── 准备阶段（无 I/O）──
+  // 防抖 500ms（line 191）
+  // 合并 updates → currentUpdates（line 109）
+
+  // ── 本地 language 处理（不涉及网络）──
+  // 无 userId 但有 language → 本地保存 language，从 attributes 中移除（line 117-140）
+
+  // ── 无 userId 有 attributes → 立即清除（line 142-147）──
+  if (Object.keys(currentUpdates.attributes ?? {}).length > 0 && !effectiveUserId) {
+    logger.error("Formbricks can't set attributes without a userId! ...");
+    this.clearUpdates();  // ⚠️ 清除，不重试
+  }
+
+  // ── 网络请求（line 150-176）──
+  if (effectiveUserId) {
+    const result = await sendUpdates({ updates: {...} });
+    // result.ok → 正常处理（line 162-170）
+    // !result.ok → 仅记录日志，不抛出（line 171-174）
+  }
+
+  // ── 清除阶段（line 179-181）──
+  this.clearUpdates();        // ⚠️ 无论成功失败，始终清除
+  this.pendingFlush = null;
+  resolve();
+}
+```
+
+#### 关键代码断言：sendUpdates 永不抛出
+
+```typescript
+// packages/js-core/src/lib/user/update.ts:79-134
+export const sendUpdates = async ({...}): Promise<Result<...>> => {
+  try {
+    const updatesResponse = await sendUpdatesToBackend({...});
+    if (!updatesResponse.ok) {
+      return err(updatesResponse.error);  // ✅ 返回 err，不抛出
+    }
+    // ... 成功处理 ...
+    return ok({ hasWarnings: ... });
+  } catch (e) {
+    // ✅ 所有异常被捕获，返回 err()
+    return err({ code: "network_error", message: "Error sending updates", ... });
+  }
+};
+```
+
+```typescript
+// packages/js-core/src/lib/user/update.ts:29-64
+export const sendUpdatesToBackend = async ({...}): Promise<Result<...>> => {
+  try {
+    const response = await api.createOrUpdateUser({...});
+    if (!response.ok) {
+      return err({...});  // ✅ HTTP 错误也返回 err，不抛出
+    }
+    return ok(response.data);
+  } catch (e) {
+    return err({ code: "network_error", ... });  // ✅ 网络异常也返回 err，不抛出
+  }
+};
+```
+
+**结论**：`processUpdates` 中 `await sendUpdates(...)` 这一行**永远不会 reject**。因此 `catch` 块（line 182-188）仅在 `config.update()` 等本地操作抛出时触发，与网络无关。
+
+#### 网络异常场景分析
+
+| 场景 | 代码路径 | updates 状态 | 重试 | 数据丢失 |
+|-----|---------|-------------|------|---------|
+| **网络完全中断** | `sendUpdatesToBackend` catch → `err({code:"network_error"})` → `sendUpdates` 返回 err → `processUpdates` line 171 log → line 179 `clearUpdates()` | ❌ 被清除 | ❌ 无重试 | ✅ 属性值丢失 |
+| **服务端 5xx 错误** | `api.createOrUpdateUser` 返回 err → `sendUpdatesToBackend` 返回 err → 同上 | ❌ 被清除 | ❌ 无重试 | ✅ 属性值丢失 |
+| **服务端 4xx 错误** | `api.createOrUpdateUser` 返回 err → 同上 | ❌ 被清除 | ❌ 无重试 | ✅ 属性值丢失 |
+| **请求超时** | `api.createOrUpdateUser` 内部超时 → 抛出 → catch → `err({code:"network_error"})` → 同上 | ❌ 被清除 | ❌ 无重试 | ✅ 属性值丢失 |
+| **CORS 阻止** | 浏览器拦截 → fetch 抛出 → catch → `err({code:"network_error"})` → 同上 | ❌ 被清除 | ❌ 无重试 | ✅ 属性值丢失 |
+| **防抖窗口内新调用覆盖** | `updateAttributes` 合并到已有 updates → 重新计时 500ms → 最终合并发送 | ✅ 合并 | — | 无丢失（合并后一起发送） |
+
+#### UpdateQueue 中唯一"保留" updates 的场景
+
+```typescript
+// packages/js-core/src/lib/user/update-queue.ts:182-188
+catch (error: unknown) {
+  this.pendingFlush = null;
+  // ⚠️ 注意：这里没有调用 this.clearUpdates()
+  logger.error(`Failed to process updates: ${...}`);
+  reject(error as Error);
+}
+```
+
+**此 catch 块仅在以下情况触发**（非网络原因）：
+- `config.update()` 抛出异常（line 103-129 或 sendUpdates 内部的 config.update）
+- `Object.keys(currentUpdates.attributes ?? {})` 抛出（极不可能）
+- `currentUpdates.userId` 访问抛出（极不可能）
+
+**即使触发此 catch，updates 也不会被自动重试**——`processUpdates` 返回的 Promise 会 reject，但调用方通常不会 await 这个结果：
+
+```typescript
+// packages/js-core/src/lib/user/user.ts:8
+export const setUserId = async (userId: string): Promise<Result<void, ApiErrorResponse>> => {
+  // ...
+  void updateQueue.processUpdates();  // ⚠️ 使用 void，不等待结果
+  return okVoid();
+};
+
+// packages/js-core/src/lib/user/attribute.ts:18
+export const setAttributes = async (...): Promise<Result<void, NetworkError>> => {
+  // ...
+  void updateQueue.processUpdates();  // ⚠️ 使用 void，不等待结果
+  return okVoid();
+};
+```
+
+#### CommandQueue 与 UpdateQueue 的协调（唯一"等待"机制）
+
+```typescript
+// packages/js-core/src/lib/common/command-queue.ts:90-96
+if (currentItem.type === CommandType.GeneralAction) {
+  const updateQueue = UpdateQueue.getInstance();
+  if (!updateQueue.isEmpty()) {
+    console.log("🧱 Formbricks - Waiting for pending updates to complete before executing command");
+    await updateQueue.processUpdates();  // ✅ 显式 await
+  }
+}
+```
+
+**场景**：用户先调用 `setAttributes({ plan: "pro" })` 然后提交问卷（GeneralAction）
+- CommandQueue 检测到 UpdateQueue 非空
+- 调用 `await updateQueue.processUpdates()` — 这次会等待结果
+- 但如果网络失败，`processUpdates` 仍然清除 updates（line 179），然后 resolve
+- CommandQueue 继续执行 GeneralAction，属性更新已丢失
+
+#### waitForPendingWork 的超时保护
+
+```typescript
+// packages/js-core/src/lib/user/update-queue.ts:72-89
+public async waitForPendingWork(): Promise<boolean> {
+  const flush = this.pendingFlush ?? this.processUpdates();
+  try {
+    const succeeded = await Promise.race([
+      flush.then(() => true as const),
+      new Promise<false>((resolve) => {
+        setTimeout(() => resolve(false), this.PENDING_WORK_TIMEOUT);  // 5秒
+      }),
+    ]);
+    return succeeded;  // true=成功完成, false=超时
+  } catch {
+    return false;  // 异常也返回 false
+  }
+}
+```
+
+| 情况 | 返回值 | updates 状态 |
+|-----|--------|-------------|
+| processUpdates 在 5 秒内完成 | `true` | 已被 clearUpdates() 清除 |
+| processUpdates 超过 5 秒 | `false` | 仍在处理中（但最终仍会被清除） |
+| processUpdates 抛出异常 | `false` | 未被清除（catch 块中未调用 clearUpdates） |
+
+**⚠️ 超时后的行为**：`waitForPendingWork` 返回 `false`，但 `processUpdates` 仍在后台运行。超时不会取消网络请求。请求完成后（无论成功失败），`clearUpdates()` 仍会被调用。
+
+#### 故障排查建议
+
+**现象：用户属性丢失，服务端未收到更新请求**
+1. 检查浏览器控制台是否有 `"Failed to send updates:"` 日志（update-queue.ts:172-174）
+2. 检查浏览器 Network 面板是否有 `/api/v2/client/[workspaceId]/user` 请求失败
+3. 如果是"先设属性后提交问卷"场景，检查是否有 `"Waiting for pending updates to complete"` 日志（command-queue.ts:94）
+
+**现象：用户属性丢失，但服务端收到了请求**
+1. 检查服务端 `updateUser` 日志是否有属性匹配（hasChanges 判定为 false）
+2. 检查 `updateAttributes` 返回的 `messages` 中是否有 `attribute_type_validation_error`、`email_already_exists`、`userid_already_exists`
+3. 检查是否触发了 `attribute_limit_exceeded`（超过 `MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT`）
+
+**现象：UI 删除属性后刷新仍然存在**
+1. 检查 `updateContactAttributes` 是否传入 `deleteRemovedAttributes: true`
+2. 检查 `deleteAttributes` 中 `prisma.contactAttribute.deleteMany` 的返回值（affected count）
+3. 确认属性键不在 `DEFAULT_ATTRIBUTES` 集合中（email, userId, firstName, lastName）
+
 ---
 
 ## 四、关键代码位置索引
