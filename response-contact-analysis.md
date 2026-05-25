@@ -583,7 +583,7 @@ buildUserStateFromContact() → segments, displays, responses
 | /user 接口验证失败 | 数据库未修改 | 返回错误消息，本地 config 不更新 |
 | getContactWithFullData 失败 | 数据库未修改 | 返回错误 |
 | createContact 失败 | 事务回滚，联系人未创建 | 返回错误 |
-| updateAttributes 操作0（deleteAttributes）失败 | 删除未生效，但后续操作不受影响 | 代码不检查返回值，可能出现"该删的没删" |
+| updateAttributes 操作0（deleteAttributes）失败 | 两种结果：① 无需删除（`keysToDelete` 为空）→ 正常返回，后续操作继续；② `deleteMany` 抛出异常 → 异常传播，操作1和操作2**不执行** | 需区分场景：① 无影响；② 后续操作被跳过 |
 | updateAttributes 操作1（已有属性更新）失败 | 事务回滚，已有属性未更新 | 操作2（新属性创建）**不会执行** |
 | updateAttributes 操作2（新属性创建）失败 | 事务回滚，新属性未创建 | 操作1已提交，已有属性已更新 |
 | buildUserStateFromContact 失败 | 属性已更新，但用户状态未返回 | 返回错误，但数据库已更新 |
@@ -754,7 +754,7 @@ if (integrations.length > 0) {
 | userId 已存在于其他联系人 | 从 payload 中移除 userId，记录警告 | 单个字段 |
 | 属性键无效（`isSafeIdentifier`） | 跳过该新属性，记录错误到 `errors` | 单个新属性 |
 | 超过属性数量限制（`MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT`） | 跳过所有新属性，记录警告 | 所有新属性 |
-| 操作0（deleteAttributes）失败 | 代码不检查返回值，**继续执行**操作1和2 | 被删除的属性值可能残留 |
+| 操作0（deleteAttributes）失败 | 两种路径：① 无需删除（`keysToDelete` 为空）→ 返回 `{success: true}`，操作1和2正常执行；② `deleteMany` 抛出异常 → 异常**直接传播**，操作1和2不执行 | 场景①：无影响；场景②：后续操作被跳过，函数抛出异常 |
 | 操作1（已有属性更新事务）失败 | 事务回滚，**抛出异常**，操作2不执行 | 所有已有属性更新被撤销 |
 | 操作2（新属性创建事务）失败 | 事务回滚，操作1已提交 | 所有新属性被撤销，已有属性已更新 |
 
@@ -809,7 +809,7 @@ if (attributeKeyIdsToDelete.length > 0) {
 | **调用方** | `updateContactAttributes`（UI 层，传入 `true`）；`updateUser`（API 层，默认 `false`） |
 | **保护机制** | `DEFAULT_ATTRIBUTES`（email, userId, firstName, lastName）永远不会被删除 |
 
-**失败影响**：删除失败不会影响后续两个事务的执行。如果操作 0 失败但操作 1 成功，会出现"该删的没删，该改的改了"的不一致状态。
+**失败影响**：`deleteAttributes` 内部的 `prisma.contactAttribute.deleteMany(...)` 没有 try-catch 包裹。若该调用抛出异常（如数据库连接失败、约束冲突），异常会**直接传播到 `updateAttributes` 并终止函数**，后续操作1和操作2**不会执行**。只有在"无需删除（`keysToDelete` 为空）"的情况下，函数才会正常返回并继续执行后续操作。
 
 #### 操作 1：更新已有属性（Transaction 1）
 
