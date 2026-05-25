@@ -149,6 +149,443 @@ export const updateContactAttributes = async (
 };
 ```
 
+### 4. Response 更新流程（responseUpdated 和 responseFinished）
+
+#### v1 Response 更新路由
+```typescript
+// apps/web/app/api/v1/client/[workspaceId]/responses/[responseId]/route.ts
+export const PUT = withV1ApiWrapper({
+  handler: putResponseHandler,
+});
+```
+
+#### putResponseHandler 处理流程
+```typescript
+// apps/web/app/api/v1/client/[workspaceId]/responses/[responseId]/lib/put-response-handler.ts:207
+export const putResponseHandler = async ({ req, props }: THandlerParams<TPutRouteParams>) => {
+  // 1. 验证输入
+  const validatedUpdateInput = await getValidatedResponseUpdateInput(req);
+  
+  // 2. 获取现有 Response
+  const existingResponse = await getResponse(responseId);
+  
+  // 3. 获取 Survey 并验证
+  const survey = await getSurvey(existingResponse.surveyId);
+  
+  // 4. 更新 Response（带配额评估）
+  const updatedResponse = await updateResponseWithQuotaEvaluation(responseId, responseUpdateInput);
+  
+  // 5. 发送 responseUpdated 事件到管道
+  await sendToPipeline({ event: "responseUpdated", ... });
+  
+  // 6. 如果 finished=true，额外发送 responseFinished 事件
+  if (updatedResponse.finished) {
+    await sendToPipeline({ event: "responseFinished", ... });
+  }
+};
+```
+
+#### updateResponseWithQuotaEvaluation 事务处理
+```typescript
+// apps/web/app/api/v1/client/[workspaceId]/responses/[responseId]/lib/response.ts:7
+export const updateResponseWithQuotaEvaluation = async (
+  responseId: string,
+  responseInput: TResponseUpdateInput
+): Promise<TResponseWithQuotaFull> => {
+  const txResponse = await prisma.$transaction(async (tx) => {
+    // 步骤1: 更新 Response 记录
+    const response = await updateResponse(responseId, responseInput, tx);
+    
+    // 步骤2: 评估配额
+    const quotaResult = await evaluateResponseQuotas({...});
+    
+    return { ...response, ...(quotaResult.quotaFull && { quotaFull: quotaResult.quotaFull }) };
+  });
+  return txResponse;
+};
+```
+
+#### updateResponse 数据合并逻辑
+```typescript
+// apps/web/lib/response/service.ts:507
+export const updateResponse = async (
+  responseId: string,
+  responseInput: TResponseUpdateInput,
+  tx?: Prisma.TransactionClient
+): Promise<TResponse> => {
+  // 1. 获取当前 Response
+  const currentResponse = await prismaClient.response.findUnique({...});
+  
+  // 2. 合并 data 对象（浅合并）
+  const data = {
+    ...currentResponse.data,
+    ...responseInput.data,
+  };
+  
+  // 3. 合并 ttc 对象
+  const mergedTtc = responseInput.ttc
+    ? { ...currentTtc, ...responseInput.ttc }
+    : currentTtc;
+  
+  // 4. 合并 variables 对象
+  const variables = {
+    ...currentResponse.variables,
+    ...responseInput.variables,
+  };
+  
+  // 5. 更新数据库
+  const responsePrisma = await prismaClient.response.update({
+    where: { id: responseId },
+    data: {
+      finished: responseInput.finished,
+      endingId: responseInput.endingId,
+      data,
+      ttc: responseInput.finished ? calculateTtcTotal(mergedTtc) : mergedTtc,
+      language: responseInput.language,
+      variables,
+    },
+    select: responseSelection,
+  });
+  
+  return response;
+};
+```
+
+#### 触发入口与数据形态
+
+| 触发方式 | 事件类型 | 数据形态 | 入库位置 |
+|---------|---------|---------|---------|
+| PUT /api/v1/client/[workspaceId]/responses/[responseId] | responseUpdated | `TResponseUpdateInput` - 包含 data, finished, ttc, variables, language, endingId | `prisma.response.update` - 合并更新 |
+| PUT /api/v1/client/[workspaceId]/responses/[responseId]（finished=true） | responseFinished | 同上 | 同上 |
+| POST /api/v2/client/[workspaceId]/responses（finished=true） | responseCreated + responseFinished | `TResponseInputV2` - 包含完整 Response 数据 | `prisma.response.create` - 新建记录 |
+
+### 5. /user 接口（v1 和 v2 版本）
+
+#### v1 /user 接口路由
+```typescript
+// apps/web/modules/ee/contacts/api/v1/client/[workspaceId]/user/route.ts:40
+export const POST = withV1ApiWrapper({
+  handler: async ({ req, props }: THandlerParams<{ params: Promise<{ workspaceId: string }> }>) => {
+    // 1. 解析输入
+    const { userId, attributes } = jsonInput;
+    
+    // 2. 检查企业版许可证
+    const isContactsEnabled = await getIsContactsEnabled(organizationId);
+    
+    // 3. 调用 updateUser
+    const { state, messages, errors } = await updateUser(workspaceId, userId, deviceType, attributes);
+    
+    // 4. 返回用户状态
+    return { response: responses.successResponse({ state, messages, errors }, true) };
+  },
+});
+```
+
+#### v2 /user 接口路由
+```typescript
+// apps/web/app/api/v2/client/[workspaceId]/user/route.ts:1
+import { OPTIONS, POST } from "@/modules/ee/contacts/api/v1/client/[workspaceId]/user/route";
+export { POST, OPTIONS };
+```
+
+**⚠️ 关键发现**：v2 /user 接口只是转发到 v1 的实现，两者使用相同的后端逻辑。
+
+#### updateUser 核心逻辑
+```typescript
+// apps/web/modules/ee/contacts/api/v1/client/[workspaceId]/user/lib/update-user.ts:132
+export const updateUser = async (
+  workspaceId: string,
+  userId: string,
+  device: "phone" | "desktop",
+  attributes?: TContactAttributesInput
+): Promise<{ state: TJsPersonState; messages?: string[]; errors?: string[] }> => {
+  // 1. 获取或创建联系人
+  let contactData = await getContactWithFullData(workspaceId, userId);
+  if (!contactData) {
+    contactData = await createContact(workspaceId, userId);
+  }
+  
+  // 2. 处理属性更新
+  if (attributes && Object.keys(attributes).length > 0) {
+    // 检查是否有变化
+    const hasChanges = Object.entries(attributes).some(
+      ([key, value]) => value !== contactAttributes[key]
+    );
+    
+    if (hasChanges) {
+      // 调用 updateAttributes 更新联系人属性
+      const { success, messages, errors } = await updateAttributes(
+        contactData.id, userId, workspaceId, attributes
+      );
+    }
+  }
+  
+  // 3. 构建用户状态（包含 segments, displays, responses 等）
+  const userState = await buildUserStateFromContact(contactData, workspaceId, userId, device);
+  
+  return {
+    state: {
+      data: { ...userState, language },
+      expiresAt: new Date(Date.now() + 1000 * 60 * 30), // 30 分钟
+    },
+    messages,
+    errors,
+  };
+};
+```
+
+#### getContactWithFullData 一次查询获取所有数据
+```typescript
+// apps/web/modules/ee/contacts/api/v1/client/[workspaceId]/user/lib/update-user.ts:11
+const getContactWithFullData = async (workspaceId: string, userId: string) => {
+  return prisma.contact.findFirst({
+    where: {
+      workspaceId,
+      attributes: {
+        some: {
+          attributeKey: { key: "userId", workspaceId },
+          value: userId,
+        },
+      },
+    },
+    select: {
+      id: true,
+      attributes: { select: { attributeKey: { select: { key: true } }, value: true } },
+      responses: { select: { surveyId: true } },
+      displays: { select: { surveyId: true, createdAt: true }, orderBy: { createdAt: "desc" } },
+    },
+  });
+};
+```
+
+#### 触发入口与数据形态
+
+| 触发方式 | HTTP 方法 | 数据形态 | 入库位置 |
+|---------|----------|---------|---------|
+| JS SDK setUserId | POST /api/v2/client/[workspaceId]/user | `{ userId: string, attributes?: Record<string, string | number> }` | `prisma.contact.findFirst` → `prisma.contact.create` / `updateAttributes` |
+| JS SDK setAttributes | POST /api/v2/client/[workspaceId]/user | 同上 | `updateAttributes` - 两个独立事务 |
+| 直接 API 调用 | POST /api/v1/client/[workspaceId]/user | 同上 | 同上 |
+
+### 6. JS SDK UpdateQueue 触发链路
+
+#### UpdateQueue 单例设计
+```typescript
+// packages/js-core/src/lib/user/update-queue.ts:7
+export class UpdateQueue {
+  private static instance: UpdateQueue | null = null;
+  private updates: TUpdates | null = null;
+  private debounceTimeout: NodeJS.Timeout | null = null;
+  private pendingFlush: Promise<void> | null = null;
+  private readonly DEBOUNCE_DELAY = 500; // 500ms 防抖
+  private readonly PENDING_WORK_TIMEOUT = 5000; // 5秒超时
+}
+```
+
+#### 触发入口 1：setUserId
+```typescript
+// packages/js-core/src/lib/user/user.ts:8
+export const setUserId = async (userId: string): Promise<Result<void, ApiErrorResponse>> => {
+  const updateQueue = UpdateQueue.getInstance();
+  
+  // 如果是不同的 userId，先清理之前的状态
+  if (currentUserId && currentUserId !== userId) {
+    tearDown();
+  }
+  
+  // 更新队列中的 userId
+  updateQueue.updateUserId(userId);
+  
+  // 触发处理
+  void updateQueue.processUpdates();
+  
+  return okVoid();
+};
+```
+
+#### 触发入口 2：setAttributes
+```typescript
+// packages/js-core/src/lib/user/attribute.ts:18
+export const setAttributes = async (
+  attributes: Record<string, string | number | Date>
+): Promise<Result<void, NetworkError>> => {
+  // 规范化值：Date → ISO 字符串
+  const normalizedAttributes: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (value instanceof Date) {
+      normalizedAttributes[key] = value.toISOString();
+    } else {
+      normalizedAttributes[key] = value;
+    }
+  }
+  
+  const updateQueue = UpdateQueue.getInstance();
+  updateQueue.updateAttributes(normalizedAttributes);
+  void updateQueue.processUpdates();
+  
+  return okVoid();
+};
+```
+
+#### UpdateQueue 数据合并
+```typescript
+// packages/js-core/src/lib/user/update-queue.ts:23
+public updateUserId(userId: string): void {
+  if (!this.updates) {
+    this.updates = { userId, attributes: {} };
+  } else {
+    this.updates = { ...this.updates, userId };
+  }
+}
+
+public updateAttributes(attributes: TAttributes): void {
+  const userId = this.updates?.userId ?? config.get().user.data.userId ?? "";
+  
+  if (!this.updates) {
+    this.updates = { userId, attributes };
+  } else {
+    this.updates = {
+      ...this.updates,
+      userId,
+      attributes: { ...this.updates.attributes, ...attributes },
+    };
+  }
+}
+```
+
+#### processUpdates 处理流程
+```typescript
+// packages/js-core/src/lib/user/update-queue.ts:91
+public async processUpdates(): Promise<void> {
+  // 1. 防抖处理（500ms）
+  // 2. 获取 userId（从 updates 或 config）
+  // 3. 特殊处理：如果只有 language 而没有 userId，本地保存 language
+  // 4. 如果有 attributes 但没有 userId，记录错误并清除
+  // 5. 调用 sendUpdates 发送到后端
+  const result = await sendUpdates({
+    updates: {
+      userId: effectiveUserId,
+      attributes: currentUpdates.attributes ?? {},
+    },
+  });
+  
+  // 6. 更新本地 config
+  config.update({
+    ...config.get(),
+    user: { ...userState },
+    filteredSurveys,
+  });
+  
+  // 7. 清除队列
+  this.clearUpdates();
+}
+```
+
+#### sendUpdates 发送到后端
+```typescript
+// packages/js-core/src/lib/user/update.ts:67
+export const sendUpdates = async ({ updates }: { updates: TUpdates }) => {
+  // 调用 sendUpdatesToBackend
+  const updatesResponse = await sendUpdatesToBackend({ appUrl, workspaceId, updates });
+  
+  // 更新本地状态
+  config.update({
+    ...config.get(),
+    user: { ...userState },
+    filteredSurveys,
+  });
+};
+
+// packages/js-core/src/lib/user/update.ts:9
+export const sendUpdatesToBackend = async ({ appUrl, workspaceId, updates }) => {
+  // 调用 ApiClient.createOrUpdateUser
+  const api = new ApiClient({ appUrl, workspaceId, isDebug });
+  const response = await api.createOrUpdateUser({
+    userId: updates.userId,
+    attributes: updates.attributes,
+  });
+  return response;
+};
+```
+
+#### ApiClient.createOrUpdateUser
+```typescript
+// packages/js-core/src/lib/common/api.ts:70
+async createOrUpdateUser(userUpdateInput: {
+  userId: string;
+  attributes?: Record<string, string | number>;
+}): Promise<Result<CreateOrUpdateUserResponse, ApiErrorResponse>> {
+  return makeRequest(
+    this.appUrl,
+    `/api/v2/client/${this.workspaceId}/user`,  // ⚠️ 调用 v2 接口
+    "POST",
+    { userId: userUpdateInput.userId, attributes: userUpdateInput.attributes },
+    this.isDebug
+  );
+}
+```
+
+#### CommandQueue 与 UpdateQueue 的协作
+```typescript
+// packages/js-core/src/lib/common/command-queue.ts:90
+if (currentItem.type === CommandType.GeneralAction) {
+  // 执行 GeneralAction 前，先等待 UpdateQueue 完成
+  const updateQueue = UpdateQueue.getInstance();
+  if (!updateQueue.isEmpty()) {
+    console.log("🧱 Formbricks - Waiting for pending updates to complete before executing command");
+    await updateQueue.processUpdates();
+  }
+}
+```
+
+#### 完整触发链路图
+
+```
+setUserId(userId)
+  ↓
+UpdateQueue.updateUserId(userId)
+  ↓
+UpdateQueue.processUpdates()
+  ↓
+防抖 500ms
+  ↓
+sendUpdates({ updates: { userId, attributes } })
+  ↓
+sendUpdatesToBackend({ appUrl, workspaceId, updates })
+  ↓
+ApiClient.createOrUpdateUser({ userId, attributes })
+  ↓
+POST /api/v2/client/[workspaceId]/user
+  ↓
+转发到 POST /api/v1/client/[workspaceId]/user
+  ↓
+updateUser(workspaceId, userId, device, attributes)
+  ↓
+getContactWithFullData() → findOrCreateContact()
+  ↓
+updateAttributes(contactId, userId, workspaceId, attributes)
+  ↓
+两个独立事务：
+  1. prisma.$transaction([upsert existing attributes])
+  2. prisma.$transaction([create new attributeKeys + attributes])
+  ↓
+buildUserStateFromContact() → segments, displays, responses
+  ↓
+返回 { state, messages, errors }
+```
+
+#### 失败时的回滚边界
+
+| 失败阶段 | 回滚边界 | 数据状态 |
+|---------|---------|---------|
+| UpdateQueue 防抖阶段 | 本地内存，无数据库操作 | updates 保留在内存中，下次调用时重试 |
+| sendUpdates 网络错误 | 未发送到后端 | updates 被清除，需要用户重新调用 |
+| /user 接口验证失败 | 数据库未修改 | 返回错误消息，本地状态不更新 |
+| getContactWithFullData 失败 | 数据库未修改 | 返回错误 |
+| createContact 失败 | 事务回滚，联系人未创建 | 返回错误 |
+| updateAttributes 事务1失败 | 现有属性未更新 | 事务回滚，新属性可能已创建 |
+| updateAttributes 事务2失败 | 新属性未创建 | 现有属性可能已更新 |
+| buildUserStateFromContact 失败 | 属性已更新，但用户状态未返回 | 返回错误，但数据库已更新 |
+
 ---
 
 ## 二、字段映射（Field Mapping）
@@ -396,13 +833,26 @@ await prisma.$transaction(
 
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
-| Response 创建 | `apps/web/app/api/v2/client/[workspaceId]/responses/lib/response.ts` | 32, 58 |
+| Response 创建（v2） | `apps/web/app/api/v2/client/[workspaceId]/responses/lib/response.ts` | 22, 92 |
+| Response 创建路由（v2） | `apps/web/app/api/v2/client/[workspaceId]/responses/route.ts` | 188 |
+| Response 更新（v1） | `apps/web/app/api/v1/client/[workspaceId]/responses/[responseId]/lib/response.ts` | 7 |
+| Response 更新路由（v1） | `apps/web/app/api/v1/client/[workspaceId]/responses/[responseId]/lib/put-response-handler.ts` | 207 |
+| Response 更新服务 | `apps/web/lib/response/service.ts` | 507 |
 | 事务数据构建 | `apps/web/app/api/v1/lib/utils.ts` | 5 |
 | 管道入队 | `apps/web/app/lib/pipelines.ts` | 5 |
 | 管道处理 | `apps/web/modules/response-pipeline/lib/process-response-pipeline-job.ts` | 582, 720 |
 | 联系人属性更新 | `apps/web/modules/ee/contacts/lib/attributes.ts` | 108 |
 | 联系人属性包装 | `apps/web/modules/ee/contacts/lib/update-contact-attributes.ts` | 19 |
+| /user 接口（v1） | `apps/web/modules/ee/contacts/api/v1/client/[workspaceId]/user/route.ts` | 40 |
+| /user 接口（v2） | `apps/web/app/api/v2/client/[workspaceId]/user/route.ts` | 1 |
+| updateUser 服务 | `apps/web/modules/ee/contacts/api/v1/client/[workspaceId]/user/lib/update-user.ts` | 132 |
 | ContactInfo 前端 | `packages/surveys/src/components/elements/contact-info-element.tsx` | - |
+| JS SDK UpdateQueue | `packages/js-core/src/lib/user/update-queue.ts` | 7, 91 |
+| JS SDK setUserId | `packages/js-core/src/lib/user/user.ts` | 8 |
+| JS SDK setAttributes | `packages/js-core/src/lib/user/attribute.ts` | 18 |
+| JS SDK sendUpdates | `packages/js-core/src/lib/user/update.ts` | 9, 67 |
+| JS SDK ApiClient | `packages/js-core/src/lib/common/api.ts` | 51, 70 |
+| JS SDK CommandQueue | `packages/js-core/src/lib/common/command-queue.ts` | 25, 90 |
 
 ---
 
@@ -443,8 +893,39 @@ const txResponse = await prisma.$transaction(async (tx) => {
 
 ## 总结
 
-1. **写入顺序**：Response 同步落库 → 异步管道处理 → （可选）联系人属性更新
-2. **字段映射**：ContactInfo 数组格式需手动转换为联系人属性键值对格式
-3. **事务边界**：Response 创建有事务，联系人属性更新有独立事务，两者不共享
-4. **失败回滚**：各层独立处理，无全局回滚机制，需业务层补偿
-5. **⚠️ 核心发现**：当前代码没有自动把 ContactInfo 答案写回联系人画像的逻辑，需额外实现
+### 核心发现
+
+1. **写入顺序**：
+   - Response 创建：同步落库 → 异步管道处理 → （可选）联系人属性更新
+   - Response 更新：PUT 更新 → 触发 responseUpdated 事件 → 如果 finished=true 额外触发 responseFinished
+   - JS SDK 属性更新：setUserId/setAttributes → UpdateQueue 防抖 → sendUpdates → POST /api/v2/client/[workspaceId]/user → updateUser → updateAttributes
+
+2. **字段映射**：
+   - ContactInfo 数组格式需手动转换为联系人属性键值对格式
+   - 映射关系：[0]→firstName, [1]→lastName, [2]→email, [3]→phone, [4]→company
+   - JS SDK 发送的属性格式：`Record<string, string | number>`
+
+3. **事务边界**：
+   - Response 创建：有事务，包含 Response 创建 + 配额评估
+   - Response 更新：有事务，包含 Response 更新 + 配额评估
+   - 联系人属性更新：两个独立事务（更新现有属性 / 创建新属性），可能部分成功
+   - Response 事务与联系人属性事务不共享
+
+4. **失败回滚**：
+   - 各层独立处理，无全局回滚机制
+   - Response 事务失败：自动回滚，Response 不写入
+   - 联系人属性事务失败：部分回滚，可能出现部分属性已更新
+   - JS SDK 网络错误：updates 被清除，需重新调用
+   - 需业务层补偿（重试、幂等性、补偿机制）
+
+5. **v1 vs v2 /user 接口**：
+   - v2 只是转发到 v1 的实现，两者使用相同的后端逻辑
+   - JS SDK 的 ApiClient.createOrUpdateUser 调用的是 v2 接口
+
+6. **JS SDK UpdateQueue 机制**：
+   - 单例设计，500ms 防抖
+   - 支持合并多次调用（userId + attributes）
+   - CommandQueue 执行 GeneralAction 前会等待 UpdateQueue 完成
+   - 5秒超时保护
+
+7. **⚠️ 核心发现**：当前代码没有自动把 ContactInfo 答案写回联系人画像的逻辑，需额外实现
