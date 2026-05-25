@@ -363,7 +363,7 @@ const getContactWithFullData = async (workspaceId: string, userId: string) => {
 | 触发方式 | HTTP 方法 | 数据形态 | 入库位置 |
 |---------|----------|---------|---------|
 | JS SDK setUserId | POST /api/v2/client/[workspaceId]/user | `{ userId: string, attributes?: Record<string, string | number> }` | `prisma.contact.findFirst` → `prisma.contact.create` / `updateAttributes` |
-| JS SDK setAttributes | POST /api/v2/client/[workspaceId]/user | 同上 | `updateAttributes` - 两个独立事务 |
+| JS SDK setAttributes | POST /api/v2/client/[workspaceId]/user | 同上 | `updateAttributes` - 三个独立写操作（操作0无事务 / 操作1有事务 / 操作2有事务） |
 | 直接 API 调用 | POST /api/v1/client/[workspaceId]/user | 同上 | 同上 |
 
 ### 6. JS SDK UpdateQueue 触发链路
@@ -564,7 +564,8 @@ getContactWithFullData() → findOrCreateContact()
   ↓
 updateAttributes(contactId, userId, workspaceId, attributes)
   ↓
-两个独立事务：
+三个独立数据库写操作（按顺序串行）：
+  0. deleteAttributes（可选，无事务）
   1. prisma.$transaction([upsert existing attributes])
   2. prisma.$transaction([create new attributeKeys + attributes])
   ↓
@@ -573,17 +574,18 @@ buildUserStateFromContact() → segments, displays, responses
 返回 { state, messages, errors }
 ```
 
-#### 失败时的回滚边界
+#### 失败时的回滚边界（摘要）
 
 | 失败阶段 | 回滚边界 | 数据状态 |
 |---------|---------|---------|
-| UpdateQueue 防抖阶段 | 本地内存，无数据库操作 | updates 保留在内存中，下次调用时重试 |
-| sendUpdates 网络错误 | 未发送到后端 | updates 被清除，需要用户重新调用 |
-| /user 接口验证失败 | 数据库未修改 | 返回错误消息，本地状态不更新 |
+| UpdateQueue 防抖阶段 | 本地内存，无数据库操作 | updates 在 `processUpdates` 末尾被 `clearUpdates()` 清除，**无重试机制** |
+| sendUpdates 网络错误 | 请求未到达或未成功处理后端 | updates 被清除，需重新调用 `setAttributes` / `setUserId` |
+| /user 接口验证失败 | 数据库未修改 | 返回错误消息，本地 config 不更新 |
 | getContactWithFullData 失败 | 数据库未修改 | 返回错误 |
 | createContact 失败 | 事务回滚，联系人未创建 | 返回错误 |
-| updateAttributes 事务1失败 | 现有属性未更新 | 事务回滚，新属性可能已创建 |
-| updateAttributes 事务2失败 | 新属性未创建 | 现有属性可能已更新 |
+| updateAttributes 操作0（deleteAttributes）失败 | 删除未生效，但后续操作不受影响 | 代码不检查返回值，可能出现"该删的没删" |
+| updateAttributes 操作1（已有属性更新）失败 | 事务回滚，已有属性未更新 | 操作2（新属性创建）**不会执行** |
+| updateAttributes 操作2（新属性创建）失败 | 事务回滚，新属性未创建 | 操作1已提交，已有属性已更新 |
 | buildUserStateFromContact 失败 | 属性已更新，但用户状态未返回 | 返回错误，但数据库已更新 |
 
 ---
@@ -731,82 +733,30 @@ if (integrations.length > 0) {
 
 ### 3. 联系人属性更新事务
 
-#### 多阶段事务设计
-`updateAttributes` 函数内部有**两个独立的 Prisma 事务**：
+#### 多阶段数据库写操作
 
-##### 事务1：更新现有属性
-```typescript
-// apps/web/modules/ee/contacts/lib/attributes.ts:276-299
-if (existingAttributes.length > 0) {
-  await prisma.$transaction(
-    existingAttributes.map(({ attributeKeyId, columns }) =>
-      prisma.contactAttribute.upsert({
-        where: {
-          contactId_attributeKeyId: { contactId, attributeKeyId },
-        },
-        update: {
-          value: columns.value,
-          valueNumber: columns.valueNumber,
-          valueDate: columns.valueDate,
-        },
-        create: {
-          contactId,
-          attributeKeyId,
-          value: columns.value,
-          valueNumber: columns.valueNumber,
-          valueDate: columns.valueDate,
-        },
-      })
-    )
-  );
-}
-```
+`updateAttributes` 函数内部包含**三个独立的数据库写操作**，按严格顺序串行执行，彼此不共享事务：
 
-##### 事务2：创建新属性
-```typescript
-// apps/web/modules/ee/contacts/lib/attributes.ts:354-374
-await prisma.$transaction(
-  preparedNewAttributes.map(({ key, dataType, columns }) =>
-    prisma.contactAttributeKey.create({
-      data: {
-        key,
-        name: formatSnakeCaseToTitleCase(key),
-        type: "custom",
-        dataType,
-        workspaceId,
-        attributes: {
-          create: {
-            contactId,
-            value: columns.value,
-            valueNumber: columns.valueNumber,
-            valueDate: columns.valueDate,
-          },
-        },
-      },
-    })
-  )
-);
-```
+| 序号 | 操作 | 事务保护 | 执行条件 |
+|-----|------|---------|---------|
+| 0 | `deleteAttributes`（删除被移除的属性值） | ❌ 无 | `deleteRemovedAttributes=true` 且存在需要删除的属性 |
+| 1 | 更新已有属性（`contactAttribute.upsert` 批量） | ✅ `$transaction` | `existingAttributes.length > 0` |
+| 2 | 创建新属性（`contactAttributeKey.create` + 嵌套 `contactAttribute.create`） | ✅ `$transaction` | `validNewAttributes.length > 0` 且未超过数量限制 |
+
+> 各操作的事务保护、执行顺序与失败级联影响详见**第 5 节**。
 
 #### 部分失败处理策略
 
 | 失败场景 | 处理方式 | 影响范围 |
 |---------|---------|---------|
-| 类型验证失败 | 跳过该属性，记录错误消息 | 单个属性 |
-| email 已存在 | 跳过 email 更新，记录警告 | 单个字段 |
-| userId 已存在 | 跳过 userId 更新，记录警告 | 单个字段 |
-| 属性键无效 | 跳过该属性，记录错误 | 单个属性 |
-| 超过属性数量限制 | 跳过所有新属性，记录警告 | 所有新属性 |
-| 现有属性更新事务失败 | 抛出异常，回滚该事务 | 所有现有属性更新 |
-| 新属性创建事务失败 | 抛出异常，回滚该事务 | 所有新属性创建 |
-
-#### 事务边界问题
-⚠️ **现有属性更新**和**新属性创建**是两个独立事务，可能出现：
-1. 现有属性更新成功
-2. 新属性创建失败
-3. 结果：部分更新，部分回滚
-
-**解决方案**：业务层需要处理这种部分成功的情况，通过 `messages` 和 `errors` 返回详细信息。
+| 类型验证失败 | 跳过该属性，记录错误消息到 `messages` | 单个属性 |
+| email 已存在于其他联系人 | 从 payload 中移除 email，记录警告 | 单个字段 |
+| userId 已存在于其他联系人 | 从 payload 中移除 userId，记录警告 | 单个字段 |
+| 属性键无效（`isSafeIdentifier`） | 跳过该新属性，记录错误到 `errors` | 单个新属性 |
+| 超过属性数量限制（`MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT`） | 跳过所有新属性，记录警告 | 所有新属性 |
+| 操作0（deleteAttributes）失败 | 代码不检查返回值，**继续执行**操作1和2 | 被删除的属性值可能残留 |
+| 操作1（已有属性更新事务）失败 | 事务回滚，**抛出异常**，操作2不执行 | 所有已有属性更新被撤销 |
+| 操作2（新属性创建事务）失败 | 事务回滚，操作1已提交 | 所有新属性被撤销，已有属性已更新 |
 
 ### 4. 跨系统一致性问题
 
@@ -933,8 +883,7 @@ await prisma.$transaction(
 **场景 1：部分属性更新成功，部分失败**
 - **现象**：联系人 `firstName` 已更新，但 `customScore` 新属性未创建
 - **根因**：操作 1 成功提交，操作 2 失败回滚
-- **排查**：检查日志中是否有 `"Created new contact attribute"` 日志（line 349），对比是否有对应的 error 日志
-- **代码行**：`attributes.ts:349` vs `attributes.ts:182-188`（UpdateQueue 的 catch，实际是 updateAttributes 的 catch）
+- **排查**：检查日志中是否有 `"Created new contact attribute"` 日志（`attributes.ts:349`），对比是否有 Prisma 事务异常日志。操作2失败时 `updateAttributes` 直接抛出异常，由路由层捕获并返回 500
 
 **场景 2：UI 提交表单后属性值丢失**
 - **现象**：通过 UI 删除一个属性值后刷新页面，值仍然存在
@@ -1209,7 +1158,7 @@ const txResponse = await prisma.$transaction(async (tx) => {
 3. **事务边界**：
    - Response 创建：有事务，包含 Response 创建 + 配额评估
    - Response 更新：有事务，包含 Response 更新 + 配额评估
-   - 联系人属性更新：两个独立事务（更新现有属性 / 创建新属性），可能部分成功
+   - 联系人属性更新：三个独立数据库写操作（操作0 deleteAttributes 无事务 / 操作1 upsert 有事务 / 操作2 create 有事务），操作1失败会阻止操作2执行，操作2失败不影响操作1
    - Response 事务与联系人属性事务不共享
 
 4. **失败回滚**：
